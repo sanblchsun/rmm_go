@@ -71,6 +71,30 @@ func sendScreenInfo(dc *webrtc.DataChannel) {
 	log.Printf("[SCREEN] Reported size: %dx%d", w, h)
 }
 
+func sendWindowInfo(dc *webrtc.DataChannel) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	wi := getForegroundWindowInfo()
+	if !wi.IsValid {
+		return
+	}
+	info := map[string]interface{}{
+		"type":   "window_info",
+		"title":  wi.Title,
+		"x":      wi.X,
+		"y":      wi.Y,
+		"width":  wi.Width,
+		"height": wi.Height,
+	}
+	b, _ := json.Marshal(info)
+	err := dc.SendText(string(b))
+	if err != nil {
+		log.Printf("[ERROR] Failed to send window_info via DataChannel: %v", err)
+	}
+	log.Printf("[WINDOW] Reported: %s (%dx%d at %d,%d)", wi.Title, wi.Width, wi.Height, wi.X, wi.Y)
+}
+
 // detectResolution определяет разрешение экрана, используя сначала ffmpeg (если есть),
 // затем robotgo.
 func detectResolution() (int, int) {
@@ -692,6 +716,11 @@ func handleControl(data []byte) {
 	case "request_screen_info":
 		if activeDataChannel != nil {
 			sendScreenInfo(activeDataChannel)
+		}
+
+	case "request_window_info":
+		if activeDataChannel != nil {
+			sendWindowInfo(activeDataChannel)
 		}
 
 	case "mouse_move":

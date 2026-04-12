@@ -18,6 +18,11 @@ var (
 	// Добавлены для получения информации о мониторе
 	monitorFromWindow = user32.NewProc("MonitorFromWindow")
 	getMonitorInfo    = user32.NewProc("GetMonitorInfoW")
+	// Функции для работы с окнами
+	getForegroundWindow = user32.NewProc("GetForegroundWindow")
+	getWindowRect       = user32.NewProc("GetWindowRect")
+	getWindowText       = user32.NewProc("GetWindowTextW")
+	getWindowTextLength = user32.NewProc("GetWindowTextLengthW")
 )
 
 const (
@@ -82,4 +87,44 @@ func getPhysicalScreenSize() (int, int) {
 
 	log.Printf("[DPI] Physical screen size from MONITORINFOEX: %dx%d", width, height)
 	return width, height
+}
+
+type WindowInfo struct {
+	Title   string
+	X       int
+	Y       int
+	Width   int
+	Height  int
+	IsValid bool
+}
+
+func getForegroundWindowInfo() WindowInfo {
+	hwnd, _, _ := getForegroundWindow.Call()
+	if hwnd == 0 {
+		return WindowInfo{IsValid: false}
+	}
+
+	var rect RECT
+	ret, _, _ := getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
+	if ret == 0 {
+		return WindowInfo{IsValid: false}
+	}
+
+	length, _, _ := getWindowTextLength.Call(hwnd)
+	title := ""
+	if length > 0 {
+		length++
+		buf := make([]uint16, length)
+		getWindowText.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), length)
+		title = syscall.UTF16ToString(buf)
+	}
+
+	return WindowInfo{
+		Title:   title,
+		X:       int(rect.Left),
+		Y:       int(rect.Top),
+		Width:   int(rect.Right - rect.Left),
+		Height:  int(rect.Bottom - rect.Top),
+		IsValid: true,
+	}
 }

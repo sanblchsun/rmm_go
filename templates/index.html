@@ -56,7 +56,10 @@
       let pc, ws, dc;
       let remoteScreenWidth = 0;
       let remoteScreenHeight = 0;
+      let currentWindow = { x: 0, y: 0, width: 0, height: 0, title: "" };
       let lastMouseMove = 0;
+      let windowInfoRequestPending = false;
+      const WINDOW_INFO_INTERVAL = 1000;
       const mouseMoveThrottle = 16; //ms, ~60fps
       let currentLayout = "en"; // 'en' или 'ru'
       let textBuffer = "";
@@ -402,6 +405,26 @@
               remoteScreenHeight,
             );
             syncVideoDimensions();
+          } else if (data.type === "window_info") {
+            windowInfoRequestPending = false;
+            currentWindow = {
+              x: data.x,
+              y: data.y,
+              width: data.width,
+              height: data.height,
+              title: data.title,
+            };
+            console.log(
+              "Received Window Info:",
+              currentWindow.title,
+              currentWindow.width,
+              "x",
+              currentWindow.height,
+              "at",
+              currentWindow.x,
+              ",",
+              currentWindow.y,
+            );
           }
         };
       }
@@ -506,7 +529,76 @@
         return { x: remoteX, y: remoteY };
       }
 
+      const EDGE_THRESHOLD = 10;
+
+      function getWindowEdgeCursor(clientX, clientY) {
+        if (
+          currentWindow.width <= 0 ||
+          currentWindow.height <= 0 ||
+          remoteScreenWidth <= 0 ||
+          remoteScreenHeight <= 0
+        ) {
+          return null;
+        }
+
+        const rect = video.getBoundingClientRect();
+        const videoNativeRatio = remoteScreenWidth / remoteScreenHeight;
+        const videoElementRatio = rect.width / rect.height;
+
+        let drawWidth, drawHeight, offsetX, offsetY;
+
+        if (videoElementRatio > videoNativeRatio) {
+          drawHeight = rect.height;
+          drawWidth = drawHeight * videoNativeRatio;
+          offsetX = (rect.width - drawWidth) / 2;
+          offsetY = 0;
+        } else {
+          drawWidth = rect.width;
+          drawHeight = drawWidth / videoNativeRatio;
+          offsetX = 0;
+          offsetY = (rect.height - drawHeight) / 2;
+        }
+
+        const xInVideo = clientX - rect.left - offsetX;
+        const yInVideo = clientY - rect.top - offsetY;
+
+        if (
+          xInVideo < 0 ||
+          xInVideo > drawWidth ||
+          yInVideo < 0 ||
+          yInVideo > drawHeight
+        ) {
+          return null;
+        }
+
+        const remoteX = Math.round(
+          clamp(xInVideo / drawWidth, 0, 1) * remoteScreenWidth,
+        );
+        const remoteY = Math.round(
+          clamp(yInVideo / drawHeight, 0, 1) * remoteScreenHeight,
+        );
+
+        const winX = remoteX - currentWindow.x;
+        const winY = remoteY - currentWindow.y;
+
+        const onTop = winY < EDGE_THRESHOLD;
+        const onBottom = winY > currentWindow.height - EDGE_THRESHOLD;
+        const onLeft = winX < EDGE_THRESHOLD;
+        const onRight = winX > currentWindow.width - EDGE_THRESHOLD;
+
+        if (onTop && onLeft) return "nw-resize";
+        if (onTop && onRight) return "ne-resize";
+        if (onBottom && onLeft) return "sw-resize";
+        if (onBottom && onRight) return "nwse-resize";
+        if (onTop || onBottom) return "ns-resize";
+        if (onLeft || onRight) return "ew-resize";
+        return null;
+      }
+
       video.addEventListener("mousemove", (e) => {
+        const cursor = getWindowEdgeCursor(e.clientX, e.clientY);
+        video.style.cursor = cursor || "default";
+
         const now = Date.now();
         if (now - lastMouseMove < mouseMoveThrottle) return;
         lastMouseMove = now;
@@ -599,6 +691,13 @@
       // Инициализация
       updateLayoutIndicator();
       connect();
+
+      setInterval(() => {
+        if (dc && dc.readyState === "open" && !windowInfoRequestPending) {
+          windowInfoRequestPending = true;
+          sendControl("request_window_info", {});
+        }
+      }, WINDOW_INFO_INTERVAL);
     </script>
   </body>
 </html>
