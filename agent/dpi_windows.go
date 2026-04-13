@@ -4,7 +4,6 @@
 package main
 
 import (
-	"log"
 	"syscall"
 	"unsafe"
 )
@@ -55,14 +54,12 @@ func getPhysicalScreenSize() (int, int) {
 	// Получаем десктопное окно
 	hwnd, _, _ := getDesktopWindow.Call()
 	if hwnd == 0 {
-		log.Println("[DPI] GetDesktopWindow failed, falling back to GetScreenSize.")
 		return 0, 0
 	}
 
 	// Получаем хэндл монитора для десктопного окна
 	hMonitor, _, _ := monitorFromWindow.Call(hwnd, MONITOR_DEFAULTTOPRIMARY)
 	if hMonitor == 0 {
-		log.Println("[DPI] MonitorFromWindow failed, falling back to GetScreenSize.")
 		return 0, 0
 	}
 
@@ -72,7 +69,6 @@ func getPhysicalScreenSize() (int, int) {
 	// Заполняем структуру информацией о мониторе
 	ret, _, _ := getMonitorInfo.Call(hMonitor, uintptr(unsafe.Pointer(&mi)))
 	if ret == 0 {
-		log.Println("[DPI] GetMonitorInfoW failed, falling back to GetScreenSize.")
 		return 0, 0
 	}
 
@@ -81,11 +77,9 @@ func getPhysicalScreenSize() (int, int) {
 	height := int(mi.RcMonitor.Bottom - mi.RcMonitor.Top)
 
 	if width == 0 || height == 0 {
-		log.Printf("[DPI] Detected 0 size from MONITORINFOEX, falling back to GetScreenSize.")
 		return 0, 0
 	}
 
-	log.Printf("[DPI] Physical screen size from MONITORINFOEX: %dx%d", width, height)
 	return width, height
 }
 
