@@ -581,6 +581,12 @@
         const winX = remoteX - currentWindow.x;
         const winY = remoteY - currentWindow.y;
 
+        const outsideWindow = winX < -EDGE_THRESHOLD || winX > currentWindow.width + EDGE_THRESHOLD ||
+                         winY < -EDGE_THRESHOLD || winY > currentWindow.height + EDGE_THRESHOLD;
+        if (outsideWindow) {
+          return null;
+        }
+
         const onTop = winY < EDGE_THRESHOLD;
         const onBottom = winY > currentWindow.height - EDGE_THRESHOLD;
         const onLeft = winX < EDGE_THRESHOLD;
@@ -596,8 +602,16 @@
       }
 
       video.addEventListener("mousemove", (e) => {
-        const cursor = getWindowEdgeCursor(e.clientX, e.clientY);
-        video.style.cursor = cursor || "default";
+        const rect = video.getBoundingClientRect();
+        let isInsideVideo = e.clientX >= rect.left && e.clientX <= rect.right &&
+                          e.clientY >= rect.top && e.clientY <= rect.bottom;
+        
+        let cursor = "default";
+        if (isInsideVideo) {
+          cursor = getWindowEdgeCursor(e.clientX, e.clientY);
+          if (cursor === null) cursor = "default";
+        }
+        video.style.cursor = cursor;
 
         const now = Date.now();
         if (now - lastMouseMove < mouseMoveThrottle) return;
