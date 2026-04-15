@@ -59,7 +59,7 @@
       let currentWindow = { x: 0, y: 0, width: 0, height: 0, title: "" };
       let lastMouseMove = 0;
       let windowInfoRequestPending = false;
-      const WINDOW_INFO_INTERVAL = 1000;
+      const WINDOW_INFO_INTERVAL = 200;
       const mouseMoveThrottle = 16; //ms, ~60fps
       let currentLayout = "en"; // 'en' или 'ru'
       let textBuffer = "";
@@ -320,7 +320,7 @@
             pc.close();
           }
           pc = new RTCPeerConnection({
-            iceServers: [],
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
           });
 
           dc = pc.createDataChannel("control");
@@ -541,51 +541,23 @@
           return null;
         }
 
-        const rect = video.getBoundingClientRect();
-        const videoNativeRatio = remoteScreenWidth / remoteScreenHeight;
-        const videoElementRatio = rect.width / rect.height;
+        const mapped = mapPointerToRemote(clientX, clientY);
+        if (!mapped) return null;
 
-        let drawWidth, drawHeight, offsetX, offsetY;
+        const winX = mapped.x - currentWindow.x;
+        const winY = mapped.y - currentWindow.y;
 
-        if (videoElementRatio > videoNativeRatio) {
-          drawHeight = rect.height;
-          drawWidth = drawHeight * videoNativeRatio;
-          offsetX = (rect.width - drawWidth) / 2;
-          offsetY = 0;
-        } else {
-          drawWidth = rect.width;
-          drawHeight = drawWidth / videoNativeRatio;
-          offsetX = 0;
-          offsetY = (rect.height - drawHeight) / 2;
-        }
-
-        const xInVideo = clientX - rect.left - offsetX;
-        const yInVideo = clientY - rect.top - offsetY;
-
+        // ✅ ГЛАВНЫЙ ФИКС — если вне окна → сбрасываем
         if (
-          xInVideo < 0 ||
-          xInVideo > drawWidth ||
-          yInVideo < 0 ||
-          yInVideo > drawHeight
+          winX < 0 ||
+          winY < 0 ||
+          winX > currentWindow.width ||
+          winY > currentWindow.height
         ) {
           return null;
         }
 
-        const remoteX = Math.round(
-          clamp(xInVideo / drawWidth, 0, 1) * remoteScreenWidth,
-        );
-        const remoteY = Math.round(
-          clamp(yInVideo / drawHeight, 0, 1) * remoteScreenHeight,
-        );
-
-        const winX = remoteX - currentWindow.x;
-        const winY = remoteY - currentWindow.y;
-
-        const outsideWindow = winX < -EDGE_THRESHOLD || winX > currentWindow.width + EDGE_THRESHOLD ||
-                         winY < -EDGE_THRESHOLD || winY > currentWindow.height + EDGE_THRESHOLD;
-        if (outsideWindow) {
-          return null;
-        }
+        const EDGE_THRESHOLD = 10;
 
         const onTop = winY < EDGE_THRESHOLD;
         const onBottom = winY > currentWindow.height - EDGE_THRESHOLD;
@@ -595,23 +567,20 @@
         if (onTop && onLeft) return "nw-resize";
         if (onTop && onRight) return "ne-resize";
         if (onBottom && onLeft) return "sw-resize";
-        if (onBottom && onRight) return "nwse-resize";
+        if (onBottom && onRight) return "se-resize";
         if (onTop || onBottom) return "ns-resize";
         if (onLeft || onRight) return "ew-resize";
+
         return null;
       }
 
+      video.addEventListener("mouseleave", () => {
+        video.style.cursor = "default";
+      });
+
       video.addEventListener("mousemove", (e) => {
-        const rect = video.getBoundingClientRect();
-        let isInsideVideo = e.clientX >= rect.left && e.clientX <= rect.right &&
-                          e.clientY >= rect.top && e.clientY <= rect.bottom;
-        
-        let cursor = "default";
-        if (isInsideVideo) {
-          cursor = getWindowEdgeCursor(e.clientX, e.clientY);
-          if (cursor === null) cursor = "default";
-        }
-        video.style.cursor = cursor;
+        const cursor = getWindowEdgeCursor(e.clientX, e.clientY);
+        video.style.cursor = cursor || "default";
 
         const now = Date.now();
         if (now - lastMouseMove < mouseMoveThrottle) return;

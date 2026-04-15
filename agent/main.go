@@ -48,7 +48,7 @@ var (
 	actualScreenWidth  int
 	actualScreenHeight int
 	activeDataChannel  *webrtc.DataChannel
-	dcMutex sync.RWMutex
+	dcMutex            sync.RWMutex
 	resolutionUpdates  = make(chan [2]int, 1)
 	reResolution       = regexp.MustCompile(`(\d{3,5})x(\d{3,5})`)
 
@@ -410,9 +410,11 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 		}
 
 		args = append(args,
-			"-vcodec", "libx264", "-preset", "medium", "-tune", "zerolatency",
+			"-vcodec", "libx264", "-preset", "ultrafast",
+			"-tune", "zerolatency", "-tune", "zerolatency",
 			"-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "30",
 			"-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
+			"-fflags", "nobuffer",
 			"-f", "h264", "-",
 		)
 
