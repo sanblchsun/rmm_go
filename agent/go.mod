@@ -6,9 +6,8 @@ go 1.24.0
 require (
 	github.com/go-vgo/robotgo v1.0.1
 	github.com/gorilla/websocket v1.5.3
-	github.com/kardianos/service v1.2.4
 	github.com/pion/webrtc/v3 v3.3.6
-	github.com/shirou/gopsutil/v4 v4.25.10
+	github.com/shirou/gopsutil/v4 v4.25.10 // indirect
 )
 
 require (
