@@ -18,22 +18,22 @@ import (
 	"syscall"
 	"time"
 
+	"unsafe"
+
 	"github.com/go-vgo/robotgo"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
-	"unsafe"
 )
 
 // --- Конфигурация ---
 const (
-	serverURL           = "ws://192.168.88.127:8000/ws/agent/agent1"
-	websocketMaxRetries = 5               // Максимальное количество попыток подключения к WebSocket
-	websocketRetryDelay = 5 * time.Second // Задержка между попытками подключения к WebSocket
+	serverURL                = "ws://192.168.88.127:8000/ws/agent/agent1"
+	websocketMaxRetries      = 5               // Максимальное количество попыток подключения к WebSocket
+	websocketRetryDelay      = 5 * time.Second // Задержка между попытками подключения к WebSocket
 	MONITOR_DEFAULTTOPRIMARY = 1
 	MONITORINFOF_PRIMARY     = 0x1
 )
-
 
 func init() {
 	if runtime.GOOS == "windows" {
@@ -43,11 +43,12 @@ func init() {
 
 // --- Глобальные переменные ---
 var (
-	user32              = syscall.NewLazyDLL("user32.dll")
-	setDPIAware         = user32.NewProc("SetProcessDPIAware")
+	user32             = syscall.NewLazyDLL("user32.dll")
+	setDPIAware        = user32.NewProc("SetProcessDPIAware")
 	actualScreenWidth  int
 	actualScreenHeight int
 	activeDataChannel  *webrtc.DataChannel
+	dcMutex sync.RWMutex
 	resolutionUpdates  = make(chan [2]int, 1)
 	reResolution       = regexp.MustCompile(`(\d{3,5})x(\d{3,5})`)
 
@@ -70,6 +71,7 @@ var (
 	getWindowRect       = user32.NewProc("GetWindowRect")
 	getWindowText       = user32.NewProc("GetWindowTextW")
 	getWindowTextLength = user32.NewProc("GetWindowTextLengthW")
+	currentFFmpegCmd    *exec.Cmd
 )
 
 func initWindowsDPI() {
@@ -110,7 +112,10 @@ func getPhysicalScreenSize() (int, int) {
 	}
 
 	// Получаем хэндл монитора для десктопного окна
-	hMonitor, _, _ := monitorFromWindow.Call(hwnd, MONITOR_DEFAULTTOPRIMARY)
+	hMonitor, _, _ := monitorFromWindow.Call(
+		hwnd,
+		uintptr(MONITOR_DEFAULTTOPRIMARY),
+	)
 	if hMonitor == 0 {
 		return 0, 0
 	}
@@ -134,6 +139,7 @@ func getPhysicalScreenSize() (int, int) {
 
 	return width, height
 }
+
 // sendScreenInfo отправляет информацию о разрешении экрана через DataChannel
 func sendScreenInfo(dc *webrtc.DataChannel) {
 	w, h := getPhysicalScreenSize()
@@ -185,7 +191,6 @@ func getForegroundWindowInfo() WindowInfo {
 		IsValid: true,
 	}
 }
-
 
 func sendWindowInfo(dc *webrtc.DataChannel) {
 	if runtime.GOOS != "windows" {
@@ -331,7 +336,11 @@ func runAgent() error {
 			}
 
 			// Также сразу отправляем информацию об изменении разрешения через DataChannel, если он активен
-			if activeDataChannel != nil {
+			dcMutex.RLock()
+			dc := activeDataChannel
+			dcMutex.RUnlock()
+
+			if dc != nil {
 				info := map[string]interface{}{
 					"type":   "screen_info",
 					"width":  res[0],
@@ -509,7 +518,6 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 
 // currentFFmpegCmd хранит ссылку на последний запущенный `ffmpeg.Cmd`.
 // Доступ к нему должен быть синхронизирован через `ffmpegMutex`.
-var currentFFmpegCmd *exec.Cmd
 
 // --- SDP/ICE ---
 func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnection,
@@ -562,36 +570,11 @@ func newPeerConnection(out chan []byte,
 		log.Printf("AddTrack error: %v", err)
 	}
 
-	// <<< ИСПРАВЛЕНИЕ: Мы должны установить обработчик активного DataChannel здесь,
-	// но также сохранить обработчик OnDataChannel, если удаленный пир захочет создать свой.
-	// В данном случае, мы хотим, чтобы агент ИНИЦИИРОВАЛ DataChannel "control".
-	// Поэтому, после AddTrack, мы его создаем и устанавливаем его обработчики.
-	// dc, err := pc.CreateDataChannel("control", nil) // Агент создает DataChannel "control"
-	// if err != nil {
-	// 	return nil, fmt.Errorf("failed to create data channel: %w", err)
-	// }
-
-	// // Устанавливаем обработчики для DataChannel, который мы ТОЛЬКО ЧТО СОЗДАЛИ
-	// dc.OnOpen(func() {
-	// 	log.Println("DataChannel opened")
-	// 	activeDataChannel = dc // Обновляем глобальную переменную activeDataChannel
-	// 	sendScreenInfo(dc)
-	// })
-	// dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-	// 	handleControl(msg.Data)
-	// })
-	// dc.OnClose(func() {
-	// 	log.Println("DataChannel closed")
-	// 	// При закрытии этого DataChannel, обнуляем активный канал.
-	// 	activeDataChannel = nil
-	// })
-
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		activeDataChannel = dc
 		dc.OnOpen(func() {
 			log.Println("DataChannel opened")
 			sendScreenInfo(dc)
-			startScreenWatcher()
 		})
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			handleControl(msg.Data)
@@ -672,7 +655,11 @@ func startScreenWatcher() {
 				}
 
 				// Если DataChannel активен, отправляем ему информацию об изменении разрешения.
-				if activeDataChannel != nil {
+				dcMutex.RLock()
+				dc := activeDataChannel
+				dcMutex.RUnlock()
+
+				if dc != nil {
 					info := map[string]interface{}{
 						"type":   "screen_info",
 						"width":  w,
@@ -694,9 +681,8 @@ func startScreenWatcher() {
 // Оно завершается, если получает сигнал из канала `quit`.
 func parseFFmpegResolution(r io.Reader, quit <-chan struct{}) {
 	const maxCapacity = 64 * 1024 // 64KB - меньше чем 1MB для защиты от краха
-	buf := make([]byte, maxCapacity)
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(buf, maxCapacity)
+	scanner.Buffer(make([]byte, 64*1024), maxCapacity)
 
 	for {
 		select {
@@ -829,12 +815,20 @@ func handleControl(data []byte) {
 
 	switch t {
 	case "request_screen_info":
-		if activeDataChannel != nil {
+		dcMutex.RLock()
+		dc := activeDataChannel
+		dcMutex.RUnlock()
+
+		if dc != nil {
 			sendScreenInfo(activeDataChannel)
 		}
 
 	case "request_window_info":
-		if activeDataChannel != nil {
+		dcMutex.RLock()
+		dc := activeDataChannel
+		dcMutex.RUnlock()
+
+		if dc != nil {
 			sendWindowInfo(activeDataChannel)
 		}
 
@@ -870,7 +864,12 @@ func handleControl(data []byte) {
 	case "mouse_down", "mouse_up":
 		// robotgo ожидает "left", "middle", "right"
 		// Предполагаем, что "button" от 0 (left), 1 (middle), 2 (right)
-		btn := int(ctl["button"].(float64))
+		btnF, ok := ctl["button"].(float64)
+		if !ok {
+			log.Println("[CONTROL] invalid button")
+			return
+		}
+		btn := int(btnF)
 		names := []string{"left", "middle", "right"}
 		if btn < 0 || btn >= len(names) {
 			log.Printf("[CONTROL] Unknown mouse button: %d", btn)
@@ -883,7 +882,12 @@ func handleControl(data []byte) {
 		}
 
 	case "mouse_toggle": // Некоторые реализации могут посылать mouse_toggle
-		btn := int(ctl["button"].(float64))
+		btnF, ok := ctl["button"].(float64)
+		if !ok {
+			log.Println("[CONTROL] invalid button")
+			return
+		}
+		btn := int(btnF)
 		state, ok := ctl["state"].(string)
 		if !ok {
 			return
@@ -900,7 +904,12 @@ func handleControl(data []byte) {
 		}
 
 	case "mouse_click": // Некоторые реализации могут посылать mouse_click
-		btn := int(ctl["button"].(float64))
+		btnF, ok := ctl["button"].(float64)
+		if !ok {
+			log.Println("[CONTROL] invalid button")
+			return
+		}
+		btn := int(btnF)
 		names := []string{"left", "middle", "right"}
 		if btn >= 0 && btn < len(names) {
 			robotgo.Click(names[btn])
