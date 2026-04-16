@@ -62,9 +62,10 @@
       const WINDOW_INFO_INTERVAL = 200;
       const mouseMoveThrottle = 16; //ms, ~60fps
       let currentLayout = "en"; // 'en' или 'ru'
-      let textBuffer = "";
-      let textBufferTimeout = null;
-      const TEXT_FLUSH_DELAY = 150; // ms
+
+      // ИСПРАВЛЕНО #3: удалены неиспользуемые переменные textBuffer,
+      // textBufferTimeout, TEXT_FLUSH_DELAY — textBuffer никогда не заполнялся,
+      // а type_string_input не обрабатывался на стороне агента.
 
       // Кириллица -> латинские клавиши (для русской раскладки)
       const cyrillicToLatinMap = {
@@ -137,25 +138,23 @@
         return Math.max(min, Math.min(max, v));
       }
 
+      // ИСПРАВЛЕНО #2 и #3: функция flushTextBuffer упрощена — убран
+      // неиспользуемый параметр и логика textBuffer.
       function flushTextBuffer() {
-        if (textBuffer.length > 0) {
-          console.log("[KEYBOARD] Sending buffered text:", textBuffer);
-          sendControl("type_string_input", { text: textBuffer });
-          textBuffer = "";
-        }
-        if (textBufferTimeout) {
-          clearTimeout(textBufferTimeout);
-          textBufferTimeout = null;
-        }
+        // Зарезервировано для будущей буферизации ввода.
       }
 
+      // ИСПРАВЛЕНО #1: пробел исключён из печатаемых клавиш.
+      // Прежде условие (e.key !== " " || e.code === "Space") было всегда true
+      // для пробела (false || true = true), поэтому пробел отправлялся как
+      // символ " ", а не как "space", что не работало в robotgo.
       function isPrintableKey(e) {
         return (
           e.key.length === 1 &&
           !e.ctrlKey &&
           !e.altKey &&
           !e.metaKey &&
-          (e.key !== " " || e.code === "Space")
+          e.key !== " " // Пробел — специальная клавиша, обрабатывается отдельно
         );
       }
 
@@ -377,7 +376,7 @@
         channel.onclose = () => {
           setStatus("Disconnected", "#f66");
           console.log("DataChannel 'control' closed.");
-          flushTextBuffer(true);
+          flushTextBuffer(); // ИСПРАВЛЕНО #2: убран лишний аргумент true
         };
         channel.onerror = (e) =>
           console.error("DataChannel 'control' error:", e);
@@ -547,7 +546,6 @@
         const winX = mapped.x - currentWindow.x;
         const winY = mapped.y - currentWindow.y;
 
-        // ✅ ГЛАВНЫЙ ФИКС — если вне окна → сбрасываем
         if (
           winX < 0 ||
           winY < 0 ||
@@ -556,8 +554,6 @@
         ) {
           return null;
         }
-
-        const EDGE_THRESHOLD = 10;
 
         const onTop = winY < EDGE_THRESHOLD;
         const onBottom = winY > currentWindow.height - EDGE_THRESHOLD;
@@ -605,7 +601,8 @@
       window.addEventListener("keydown", (e) => {
         if (!dc || dc.readyState !== "open") return;
 
-        // Если это печатаемый символ
+        // ИСПРАВЛЕНО #1: isPrintableKey теперь исключает пробел,
+        // поэтому пробел попадает в ветку mapKeyEventToRobotKey → "space".
         if (isPrintableKey(e) && e.key.length === 1) {
           let latKey = e.key;
 
@@ -614,14 +611,13 @@
             latKey = cyrillicToLatinMap[latKey.toLowerCase()] || latKey;
           }
 
-          // Отправляем нажатие клавиши
           sendControl("key_down", { key: latKey });
           e.preventDefault();
           return;
         }
 
-        // Обработка специальных клавиш
-        flushTextBuffer(); // отправляем буферизированный текст
+        // Обработка специальных клавиш (включая пробел)
+        flushTextBuffer();
 
         const robotKey = mapKeyEventToRobotKey(e);
         if (robotKey) {
@@ -635,7 +631,6 @@
       window.addEventListener("keyup", (e) => {
         if (!dc || dc.readyState !== "open") return;
 
-        // Для кириллических символов, отправляем key_up соответствующей латинской клавиши
         if (
           isPrintableKey(e) &&
           e.key.length === 1 &&
@@ -647,7 +642,6 @@
           return;
         }
 
-        // На остальные клавиши
         const robotKey = mapKeyEventToRobotKey(e);
         if (robotKey) {
           e.preventDefault();
@@ -657,7 +651,6 @@
         }
       });
 
-      // Обработчик для потери фокуса, чтобы сбрасывать буфер
       window.addEventListener("blur", () => {
         flushTextBuffer();
       });

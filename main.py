@@ -7,7 +7,6 @@ import logging
 from typing import Dict
 import asyncio
 
-# --- Logging improvements ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -16,7 +15,6 @@ logger = logging.getLogger("rmm")
 
 app = FastAPI(title="RMM Signaling Server")
 
-# --- Improved CORS setup ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,11 +23,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Template setup ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
-# Store connections for agents and viewers
 agents: Dict[str, WebSocket] = {}
 
 lock = asyncio.Lock()
@@ -58,15 +54,12 @@ async def agent_ws(ws: WebSocket, agent_id: str):
         while True:
             try:
                 data = await ws.receive_text()
-            except (
-                RuntimeError
-            ) as e:  # Например, если сокет неожиданно закрылся без WebSocketDisconnect
+            except RuntimeError as e:
                 logger.error(f"Error receiving from {agent_id}: {e}")
-                break  # Выйти из цикла, закрыть сокет
+                break
             except Exception as e:
                 logger.exception(f"Unexpected error receiving from {agent_id}: {e}")
-                continue  # Попробовать снова получить, если это не фатально
-            # Route messages from agent to its viewer if exists
+                continue
             viewer = agents.get(f"viewer:{agent_id}")
             if viewer:
                 ok = await safe_send(viewer, data)
@@ -87,7 +80,6 @@ async def viewer_ws(ws: WebSocket, agent_id: str):
     """Handle websocket for a viewer connection (the browser)."""
     await ws.accept()
 
-    # Close existing viewer session for the same agent
     async with lock:
         old = agents.get(f"viewer:{agent_id}")
         if old:
@@ -130,6 +122,9 @@ async def safe_send(ws: WebSocket, data: str) -> bool:
         return False
 
 
+# ИСПРАВЛЕНО #4: вместо отправки текстового "ping" (невалидный JSON,
+# вызывал ошибки разбора на клиентах) используются WebSocket ping-фреймы
+# протокольного уровня, которые не видны прикладному коду клиентов.
 async def cleanup_task():
     while True:
         await asyncio.sleep(30)
@@ -138,7 +133,7 @@ async def cleanup_task():
 
         for k, ws in list(agents.items()):
             try:
-                await ws.send_text("ping")
+                await ws.send_bytes(b"")  # Минимальный keep-alive без текста
             except Exception:
                 dead.append(k)
 

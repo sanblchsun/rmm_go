@@ -29,8 +29,8 @@ import (
 // --- Конфигурация ---
 const (
 	serverURL                = "ws://192.168.88.127:8000/ws/agent/agent1"
-	websocketMaxRetries      = 5               // Максимальное количество попыток подключения к WebSocket
-	websocketRetryDelay      = 5 * time.Second // Задержка между попытками подключения к WebSocket
+	websocketMaxRetries      = 5
+	websocketRetryDelay      = 5 * time.Second
 	MONITOR_DEFAULTTOPRIMARY = 1
 	MONITORINFOF_PRIMARY     = 0x1
 )
@@ -56,22 +56,23 @@ var (
 	videoFramesSent int64
 	videoStatsLock  sync.Mutex
 
-	// Канал для сигнализации о перезапуске FFmpeg
 	ffmpegRestartSignal = make(chan struct{}, 1)
 	ffmpegMutex         sync.Mutex
 	ffmpegStatsReset    = make(chan struct{}, 1)
 	getDpiForWindow     = user32.NewProc("GetDpiForWindow")
 	getDesktopWindow    = user32.NewProc("GetDesktopWindow")
 	getSystemMetricsFor = user32.NewProc("GetSystemMetricsForDpi")
-	// Добавлены для получения информации о мониторе
-	monitorFromWindow = user32.NewProc("MonitorFromWindow")
-	getMonitorInfo    = user32.NewProc("GetMonitorInfoW")
-	// Функции для работы с окнами
+	monitorFromWindow   = user32.NewProc("MonitorFromWindow")
+	getMonitorInfo      = user32.NewProc("GetMonitorInfoW")
 	getForegroundWindow = user32.NewProc("GetForegroundWindow")
 	getWindowRect       = user32.NewProc("GetWindowRect")
 	getWindowText       = user32.NewProc("GetWindowTextW")
 	getWindowTextLength = user32.NewProc("GetWindowTextLengthW")
-	currentFFmpegCmd    *exec.Cmd
+
+	// ИСПРАВЛЕНО #10: комментарий перенесён к объявлению переменной.
+	// currentFFmpegCmd хранит ссылку на последний запущенный exec.Cmd FFmpeg.
+	// Доступ к нему должен быть синхронизирован через ffmpegMutex.
+	currentFFmpegCmd *exec.Cmd
 )
 
 func initWindowsDPI() {
@@ -83,7 +84,7 @@ type MONITORINFOEX struct {
 	RcMonitor RECT
 	RcWork    RECT
 	DwFlags   uint32
-	SzDevice  [32]uint16 // TCHAR * 32
+	SzDevice  [32]uint16
 }
 
 type RECT struct {
@@ -102,16 +103,12 @@ type WindowInfo struct {
 	IsValid bool
 }
 
-// getPhysicalScreenSize получает разрешение экрана игнорируя системное масштабирование
-// для текущего основного монитора.
 func getPhysicalScreenSize() (int, int) {
-	// Получаем десктопное окно
 	hwnd, _, _ := getDesktopWindow.Call()
 	if hwnd == 0 {
 		return 0, 0
 	}
 
-	// Получаем хэндл монитора для десктопного окна
 	hMonitor, _, _ := monitorFromWindow.Call(
 		hwnd,
 		uintptr(MONITOR_DEFAULTTOPRIMARY),
@@ -123,13 +120,11 @@ func getPhysicalScreenSize() (int, int) {
 	var mi MONITORINFOEX
 	mi.CbSize = uint32(unsafe.Sizeof(mi))
 
-	// Заполняем структуру информацией о мониторе
 	ret, _, _ := getMonitorInfo.Call(hMonitor, uintptr(unsafe.Pointer(&mi)))
 	if ret == 0 {
 		return 0, 0
 	}
 
-	// RcMonitor содержит физические размеры монитора (без учета масштабирования DPI)
 	width := int(mi.RcMonitor.Right - mi.RcMonitor.Left)
 	height := int(mi.RcMonitor.Bottom - mi.RcMonitor.Top)
 
@@ -140,18 +135,15 @@ func getPhysicalScreenSize() (int, int) {
 	return width, height
 }
 
-// sendScreenInfo отправляет информацию о разрешении экрана через DataChannel
 func sendScreenInfo(dc *webrtc.DataChannel) {
 	w, h := getPhysicalScreenSize()
 	if w == 0 || h == 0 {
 		w, h = detectResolution()
 	}
-	// Важно: actualScreenWidth и actualScreenHeight уже обновлены в других местах (init, screen watcher, ffmpeg parser).
-	// Здесь мы просто отправляем текущие значения.
 	info := map[string]interface{}{
 		"type":   "screen_info",
-		"width":  w, // Используем фактически найденные размеры
-		"height": h, // Используем фактически найденные размеры
+		"width":  w,
+		"height": h,
 	}
 	b, _ := json.Marshal(info)
 	err := dc.SendText(string(b))
@@ -215,8 +207,6 @@ func sendWindowInfo(dc *webrtc.DataChannel) {
 	}
 }
 
-// detectResolution определяет разрешение экрана, используя сначала ffmpeg (если есть),
-// затем robotgo.
 func detectResolution() (int, int) {
 	var args []string
 	if runtime.GOOS == "windows" {
@@ -235,7 +225,6 @@ func detectResolution() (int, int) {
 			}
 		}
 	}
-	// Если ffmpeg не смог определить или произошла ошибка, используем robotgo
 	w, h := robotgo.GetScreenSize()
 	log.Printf("[SCREEN] Fallback to RobotGo screen size: %dx%d", w, h)
 	return w, h
@@ -251,18 +240,16 @@ func main() {
 		err := runAgent()
 		if err == nil {
 			log.Println("Agent stopped gracefully.")
-			break // Успешное завершение runAgent, выходим из цикла
+			break
 		}
 		log.Printf("Agent encountered an error: %v. Retrying in %v...", err, websocketRetryDelay)
 		time.Sleep(websocketRetryDelay)
 	}
 
 	log.Printf("Exiting after %d failed WebSocket connection attempts.", websocketMaxRetries)
-	os.Exit(1) // Выходим с кодом ошибки, если все попытки провалились
+	os.Exit(1)
 }
 
-// runAgent содержит основную логику работы агента, включая WebSocket-соединение.
-// Она возвращает nil при чистом закрытии WebSocket или ошибку при его разрыве.
 func runAgent() error {
 	ws, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
 	if err != nil {
@@ -272,15 +259,11 @@ func runAgent() error {
 	log.Println("Connected to WebSocket server.")
 
 	writeChan := make(chan []byte, 100)
-	// Горутина для отправки сообщений через WebSocket
 	go func() {
 		for msg := range writeChan {
 			err := ws.WriteMessage(websocket.TextMessage, msg)
 			if err != nil {
 				log.Printf("WebSocket write error: %v. Stopping write goroutine.", err)
-				// В случае ошибки записи, закрываем канал, чтобы сообщить другим горутинам
-				// о проблеме с WS и не блокироваться на writeChan.
-				// Важно: не закрывать ws здесь, это делает defer в runAgent.
 				return
 			}
 		}
@@ -297,7 +280,6 @@ func runAgent() error {
 		return fmt.Errorf("track create error: %w", err)
 	}
 
-	// Инициализация глобальных переменных разрешения перед первым запуском FFmpeg
 	currentW, currentH := getPhysicalScreenSize()
 	if currentW == 0 && currentH == 0 {
 		currentW, currentH = detectResolution()
@@ -305,37 +287,28 @@ func runAgent() error {
 	actualScreenWidth, actualScreenHeight = currentW, currentH
 	log.Printf("Initial screen size set to: %dx%d", actualScreenWidth, actualScreenHeight)
 
-	// Запускаем горутину, которая управляет жизненным циклом FFmpeg
 	go manageFFmpegProcess(videoTrack)
-
-	// Запускаем горутину, которая следит за разрешением экрана
-	startScreenWatcher() // Теперь без DataChannel, следит только за изменением разрешения и сигнализирует FFmpeg
-
-	// Запускаем горутину для вывода статистики
+	startScreenWatcher()
 	startVideoStats()
 
-	// Горутина, которая слушает обновления разрешения от FFmpeg
 	go func() {
 		for res := range resolutionUpdates {
 			if actualScreenWidth == res[0] && actualScreenHeight == res[1] {
-				// Разрешение совпадает с текущим, игнорируем
 				continue
 			}
 			log.Printf("[FFmpeg] Video stream size detected %dx%d. Current: %dx%d. Signaling FFmpeg restart.",
 				res[0], res[1], actualScreenWidth, actualScreenHeight)
 
-			actualScreenWidth, actualScreenHeight = res[0], res[1] // Обновляем глобальные переменные
+			actualScreenWidth, actualScreenHeight = res[0], res[1]
 
-			// Сигнализируем о необходимости перезапустить FFmpeg
 			select {
 			case ffmpegRestartSignal <- struct{}{}:
-				// Отправили сигнал, если канал не заблокирован
 			default:
-				// Канал заблокирован, значит, сигнал уже в очереди или процесс перезапуска уже идет
 				log.Println("[FFmpeg] Restart signal already pending, skipping.")
 			}
 
-			// Также сразу отправляем информацию об изменении разрешения через DataChannel, если он активен
+			// ИСПРАВЛЕНО #8: используем локальную переменную dc (прочитанную
+			// под мьютексом), а не activeDataChannel напрямую.
 			dcMutex.RLock()
 			dc := activeDataChannel
 			dcMutex.RUnlock()
@@ -347,7 +320,7 @@ func runAgent() error {
 					"height": res[1],
 				}
 				b, _ := json.Marshal(info)
-				err := activeDataChannel.SendText(string(b))
+				err := dc.SendText(string(b)) // ИСПРАВЛЕНО #8
 				if err != nil {
 					log.Printf("[ERROR] Failed to send updated screen_info via DataChannel: %v", err)
 				}
@@ -356,15 +329,14 @@ func runAgent() error {
 		}
 	}()
 
-	// Основной цикл чтения сообщений из WebSocket
 	for {
 		_, msg, err := ws.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Println("WebSocket closed cleanly.")
-				return nil // Чистое закрытие WS, можно не переподключаться
+				return nil
 			}
-			return fmt.Errorf("websocket read error: %w", err) // Ошибка чтения, вызываем переподключение
+			return fmt.Errorf("websocket read error: %w", err)
 		}
 		if handleSDP(msg, writeChan, pcs, &pcsLock, videoTrack) {
 			continue
@@ -373,22 +345,15 @@ func runAgent() error {
 	}
 }
 
-// manageFFmpegProcess управляет жизненным циклом процесса FFmpeg.
-// Он запускает FFmpeg, следит за ним и перезапускает по сигналу или при сбое.
 func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 	for {
 		log.Println("[FFmpeg Manager] Starting new FFmpeg process cycle...")
 
-		// Канал для сигнализации горутинам чтения stdout/stderr, что надо завершаться.
-		// Важно: он должен быть создан заново для каждого нового цикла FFmpeg,
-		// чтобы корректно сигнализировать новым горутинам.
 		quitSignal := make(chan struct{})
 
 		ffmpegMutex.Lock()
-		// Прежде чем запускать новый FFmpeg, убедимся, что предыдущий процесс полностью завершен
-		// и его ссылки обнулены. Это дополнительная мера предосторожности.
 		if currentFFmpegCmd != nil && currentFFmpegCmd.Process != nil {
-			log.Println("[FFmpeg Manager] Warning: Previous FFmpeg process still active when starting new cycle. Terminating it.")
+			log.Println("[FFmpeg Manager] Warning: Previous FFmpeg process still active. Terminating it.")
 			_ = currentFFmpegCmd.Process.Kill()
 		}
 		ffmpegMutex.Unlock()
@@ -409,9 +374,10 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 			args = append(args, "-s", fmt.Sprintf("%dx%d", actualScreenWidth, actualScreenHeight))
 		}
 
+		// ИСПРАВЛЕНО #5: удалён дублирующийся флаг "-tune zerolatency".
 		args = append(args,
 			"-vcodec", "libx264", "-preset", "ultrafast",
-			"-tune", "zerolatency", "-tune", "zerolatency",
+			"-tune", "zerolatency",
 			"-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "30",
 			"-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
 			"-fflags", "nobuffer",
@@ -421,7 +387,6 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 		log.Printf("[FFmpeg Manager] Executing command: ffmpeg %v", strings.Join(args, " "))
 		cmd = exec.Command("ffmpeg", args...)
 
-		// Сохраняем ссылку на текущий процесс сразу после создания, чтобы он был доступен для остановки
 		ffmpegMutex.Lock()
 		currentFFmpegCmd = cmd
 		ffmpegMutex.Unlock()
@@ -430,7 +395,7 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 		if err != nil {
 			log.Printf("[FFmpeg Manager] FFmpeg stdout pipe error: %v. Restarting in 5s.", err)
 			time.Sleep(5 * time.Second)
-			close(quitSignal) // Закрываем quitSignal для всех, кто мог начать его слушать (маловероятно здесь)
+			close(quitSignal)
 			continue
 		}
 		stderr, err = cmd.StderrPipe()
@@ -441,7 +406,9 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 			close(quitSignal)
 			continue
 		}
-		// Не читаем stderr - просто закрываем чтобы избежать блокировки FFmpeg
+		// ИСПРАВЛЕНО #9: parseFFmpegResolution никогда не вызывалась —
+		// stderr просто отбрасывается. Функция parseFFmpegResolution удалена
+		// как мёртвый код.
 		go func() { io.Copy(io.Discard, stderr) }()
 
 		if err = cmd.Start(); err != nil {
@@ -457,37 +424,27 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 		var wg sync.WaitGroup
 		wg.Add(1)
 
-		// Горутина для стриминга видео (чтение stdout и отправка в WebRTC)
 		go func() {
 			defer wg.Done()
 			streamVideo(stdout, videoTrack, quitSignal)
 		}()
 
-		// Горутина для ожидания завершения процесса FFmpeg.
-		// Как только FFmpeg завершится, она пошлет сигнал завершения всем остальным горутинам
-		// и затем дождется их.
 		ffmpegMonitorDone := make(chan struct{})
 		go func() {
-			defer close(ffmpegMonitorDone) // Сигнализируем, что монитор FFmpeg завершился
-			err := cmd.Wait()              // Ждем завершения FFmpeg
+			defer close(ffmpegMonitorDone)
+			err := cmd.Wait()
 			if err != nil {
 				log.Printf("[FFmpeg Manager] FFmpeg process exited with error: %v", err)
 			} else {
 				log.Println("[FFmpeg Manager] FFmpeg process exited normally.")
 			}
-			// Когда FFmpeg завершился, сигнализируем читающим горутинам, чтобы они тоже завершились.
 			log.Println("[FFmpeg Manager] FFmpeg process finished. Sending quit signal to reader goroutines.")
-			close(quitSignal) // Закрываем канал, чтобы все получатели завершились
+			close(quitSignal)
 		}()
 
-		// Основной менеджер ждет одного из двух событий:
-		// 1. Сигнал на перезапуск от screen watcher / resolutionUpdates.
-		// 2. Штатное или ошибочное завершение FFmpeg (через ffmpegMonitorDone).
 		select {
 		case <-ffmpegRestartSignal:
 			log.Println("[FFmpeg Manager] Received external restart signal. Terminating current FFmpeg process.")
-			// Если мы получили сигнал на перезапуск, нам нужно "убить" текущий процесс FFmpeg.
-			// Горутина ffmpegMonitorDone обнаружит это завершение и сама отправит quitSignal.
 			ffmpegMutex.Lock()
 			if cmd != nil && cmd.Process != nil {
 				log.Println("[FFmpeg Manager] Terminating FFmpeg process...")
@@ -506,20 +463,15 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 			default:
 			}
 		case <-ffmpegMonitorDone:
-			log.Println("[FFmpeg Manager] FFmpeg process completed its lifecycle (exited or errored). Moving to next cycle.")
-			// В этом случае quitSignal уже был отправлен горутиной ffmpegMonitorDone.
+			log.Println("[FFmpeg Manager] FFmpeg process completed its lifecycle. Moving to next cycle.")
 		}
 
-		// Ждем, пока все дочерние горутины, связанные с этим циклом FFmpeg, завершатся.
 		wg.Wait()
-		<-ffmpegMonitorDone // Удостоверяемся, что горутина-монитор FFmpeg также завершилась.
+		<-ffmpegMonitorDone
 		log.Println("[FFmpeg Manager] All components of previous FFmpeg cycle stopped. Preparing for next run.")
-		time.Sleep(1 * time.Second) // Небольшая пауза перед следующим запуском
+		time.Sleep(1 * time.Second)
 	}
 }
-
-// currentFFmpegCmd хранит ссылку на последний запущенный `ffmpeg.Cmd`.
-// Доступ к нему должен быть синхронизирован через `ffmpegMutex`.
 
 // --- SDP/ICE ---
 func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnection,
@@ -573,7 +525,11 @@ func newPeerConnection(out chan []byte,
 	}
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		// ИСПРАВЛЕНО #7: запись activeDataChannel защищена мьютексом.
+		dcMutex.Lock()
 		activeDataChannel = dc
+		dcMutex.Unlock()
+
 		dc.OnOpen(func() {
 			log.Println("DataChannel opened")
 			sendScreenInfo(dc)
@@ -583,7 +539,10 @@ func newPeerConnection(out chan []byte,
 		})
 		dc.OnClose(func() {
 			log.Println("DataChannel closed")
+			// ИСПРАВЛЕНО #7: обнуление activeDataChannel защищено мьютексом.
+			dcMutex.Lock()
 			activeDataChannel = nil
+			dcMutex.Unlock()
 		})
 	})
 
@@ -599,7 +558,10 @@ func newPeerConnection(out chan []byte,
 		log.Printf("Peer Connection State has changed to %s\n", s.String())
 		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
 			log.Printf("PeerConnection %s, detaching activeDataChannel.", s.String())
-			activeDataChannel = nil // Сбрасываем ссылку на активный канал при разрыве соединения
+			// ИСПРАВЛЕНО #7: обнуление activeDataChannel защищено мьютексом.
+			dcMutex.Lock()
+			activeDataChannel = nil
+			dcMutex.Unlock()
 		}
 	})
 
@@ -609,13 +571,12 @@ func newPeerConnection(out chan []byte,
 func handleICE(msg []byte, pcs map[string]*webrtc.PeerConnection, lock *sync.Mutex) {
 	var ice webrtc.ICECandidateInit
 	if err := json.Unmarshal(msg, &ice); err != nil || ice.Candidate == "" {
-		// Некоторые сообщения могут быть не ICE-кандидатами, игнорируем их
 		return
 	}
 	lock.Lock()
 	defer lock.Unlock()
 	for _, pc := range pcs {
-		if pc.RemoteDescription() != nil { // Кандидаты можно добавлять только после установки RemoteDescription
+		if pc.RemoteDescription() != nil {
 			err := pc.AddICECandidate(ice)
 			if err != nil {
 				log.Printf("AddICECandidate error: %v", err)
@@ -624,19 +585,13 @@ func handleICE(msg []byte, pcs map[string]*webrtc.PeerConnection, lock *sync.Mut
 	}
 }
 
-// startScreenWatcher периодически проверяет изменение размеров экрана и сигнализирует о перезапуске FFmpeg.
-// Оно больше не принимает DataChannel.
 func startScreenWatcher() {
 	go func() {
-		// Используем локальные переменные для отслеживания текущего состояния экрана
-		//, чтобы не зависеть от активного DataChannel.
 		prevW, prevH := actualScreenWidth, actualScreenHeight
 		for {
 			time.Sleep(3 * time.Second)
 
 			w, h := getPhysicalScreenSize()
-			// Добавим fallback на detectResolution если getPhysicalScreenSize возвращает 0,
-			// т.к. getPhysicalScreenSize может не всегда работать.
 			if w == 0 || h == 0 {
 				w, h = detectResolution()
 			}
@@ -644,19 +599,16 @@ func startScreenWatcher() {
 			if w != prevW || h != prevH {
 				log.Printf("[SCREEN] Detected screen size change: %dx%d -> %dx%d.", prevW, prevH, w, h)
 				prevW, prevH = w, h
-				// Обновляем глобальные переменные, которые используются FFmpeg
 				actualScreenWidth, actualScreenHeight = w, h
 
-				// Отправляем сигнал на перезапуск FFmpeg
 				select {
 				case ffmpegRestartSignal <- struct{}{}:
 					log.Println("[SCREEN] Signaling FFmpeg restart due to resolution change.")
 				default:
-					// Канал заблокирован, значит, сигнал уже в очереди
 					log.Println("[SCREEN] Restart signal already pending from screen watcher, skipping.")
 				}
 
-				// Если DataChannel активен, отправляем ему информацию об изменении разрешения.
+				// ИСПРАВЛЕНО #8: используем локальную переменную dc.
 				dcMutex.RLock()
 				dc := activeDataChannel
 				dcMutex.RUnlock()
@@ -668,7 +620,7 @@ func startScreenWatcher() {
 						"height": h,
 					}
 					b, _ := json.Marshal(info)
-					err := activeDataChannel.SendText(string(b))
+					err := dc.SendText(string(b)) // ИСПРАВЛЕНО #8
 					if err != nil {
 						log.Printf("[ERROR] Failed to send screen_info via DataChannel: %v", err)
 					}
@@ -679,56 +631,12 @@ func startScreenWatcher() {
 	}()
 }
 
-// parseFFmpegResolution читает stderr FFmpeg и парсит разрешение.
-// Оно завершается, если получает сигнал из канала `quit`.
-func parseFFmpegResolution(r io.Reader, quit <-chan struct{}) {
-	const maxCapacity = 64 * 1024 // 64KB - меньше чем 1MB для защиты от краха
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), maxCapacity)
-
-	for {
-		select {
-		case <-quit:
-			return
-		default:
-		}
-		line, ok := func() (string, bool) {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("[FFmpeg Stderr] Recovered from panic: %v", r)
-				}
-			}()
-			if !scanner.Scan() {
-				return "", false
-			}
-			return scanner.Text(), true
-		}()
-		if !ok || line == "" {
-			return
-		}
-		if strings.Contains(line, "Video:") {
-			if m := reResolution.FindStringSubmatch(line); len(m) == 3 {
-				w, _ := strconv.Atoi(m[1])
-				h, _ := strconv.Atoi(m[2])
-				if w > 0 && h > 0 {
-					select {
-					case resolutionUpdates <- [2]int{w, h}:
-					default:
-					}
-				}
-			}
-		}
-	}
-}
-
-// streamVideo считывает видеоданные из stdout FFmpeg и отправляет их в videoTrack.
-// Оно завершается, если получает сигнал из канала `quit`.
 func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-chan struct{}) {
 	reader := bufio.NewReader(r)
-	const maxNALUBufferSize = 2 * 1024 * 1024 // 2MB
+	const maxNALUBufferSize = 2 * 1024 * 1024
 	buf := make([]byte, 0, maxNALUBufferSize)
 
-	tmp := make([]byte, 4096) // Буфер для чтения из io.Reader
+	tmp := make([]byte, 4096)
 	for {
 		select {
 		case <-quit:
@@ -741,14 +649,10 @@ func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-
 					log.Printf("[FFmpeg Video Stream] FFmpeg read error: %v", err)
 				}
 				log.Println("[FFmpeg Video Stream] EOF or pipe closed.")
-				return // Завершаем горутину, FFmpeg, вероятно, прекратил работу
+				return
 			}
-			// Проверяем, не превысит ли добавление текущих данных максимально допустимый размер буфера.
 			if len(buf)+n > maxNALUBufferSize {
-				log.Printf("[FFmpeg Video Stream] NALU buffer exceeded max capacity (%d bytes). This indicates a problem like missing start codes or corrupted stream. Exiting streamer.", maxNALUBufferSize)
-				// В данном случае, повреждение потока или отсутствие стартовых кодов может привести
-				// к тому, что NALU никогда не будут найдены и буфер будет расти бесконечно.
-				// Лучше дать manageFFmpegProcess перезапустить FFmpeg.
+				log.Printf("[FFmpeg Video Stream] NALU buffer exceeded max capacity (%d bytes). Exiting streamer.", maxNALUBufferSize)
 				return
 			}
 			buf = append(buf, tmp[:n]...)
@@ -756,22 +660,19 @@ func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-
 			for {
 				start := findStartCode(buf)
 				if start == -1 {
-					break // Неполный NALU, ждем еще данных
+					break
 				}
 
 				next := findStartCode(buf[start+4:])
 				if next == -1 {
-					break // Не нашли следующий стартовый код, ждем
+					break
 				}
-				next += start + 4 // Смещаем relative next pointer к абсолютному
+				next += start + 4
 
 				nalu := buf[start:next]
 
-				// Дополнительная проверка на пустой NALU после findStartCode,
-				// хотя по логике findStartCode(buf[start+4:]) это должно исключать.
 				if len(nalu) == 0 {
-					// Если по какой-то причине NALU оказался пустым, пропускаем его.
-					buf = buf[next:] // Продолжаем поиск в оставшейся части
+					buf = buf[next:]
 					continue
 				}
 
@@ -787,16 +688,14 @@ func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-
 					videoFramesSent++
 					videoStatsLock.Unlock()
 				}
-				buf = buf[next:] // Обрезаем буфер, оставляя только необработанные данные
+				buf = buf[next:]
 			}
 		}
 	}
 }
 
-// findStartCode находит стартовый код H.264 NALU (00 00 00 01).
 func findStartCode(data []byte) int {
 	for i := 0; i < len(data)-3; i++ {
-		// Оптимизация: проверять только если первый байт 0, так как стартовый код начинается с 00 00 00 01
 		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
 			return i
 		}
@@ -813,25 +712,27 @@ func handleControl(data []byte) {
 	}
 
 	t, _ := ctl["type"].(string)
-	// log.Printf("[CONTROL] %+v", ctl) // Закомментировано для уменьшения логов, если часто срабатывает
 
 	switch t {
 	case "request_screen_info":
+		// ИСПРАВЛЕНО #8: используем локальную переменную dc вместо повторного
+		// обращения к activeDataChannel после освобождения мьютекса.
 		dcMutex.RLock()
 		dc := activeDataChannel
 		dcMutex.RUnlock()
 
 		if dc != nil {
-			sendScreenInfo(activeDataChannel)
+			sendScreenInfo(dc) // ИСПРАВЛЕНО #8
 		}
 
 	case "request_window_info":
+		// ИСПРАВЛЕНО #8: аналогично.
 		dcMutex.RLock()
 		dc := activeDataChannel
 		dcMutex.RUnlock()
 
 		if dc != nil {
-			sendWindowInfo(activeDataChannel)
+			sendWindowInfo(dc) // ИСПРАВЛЕНО #8
 		}
 
 	case "mouse_move":
@@ -840,22 +741,14 @@ func handleControl(data []byte) {
 		if !okX || !okY {
 			return
 		}
-		// Используем actualScreenWidth/Height для масштабирования,
-		// чтобы корректно преобразовать координаты от клиента
-		// к текущему физическому разрешению.
 		currentDisplayW, currentDisplayH := robotgo.GetScreenSize()
-		// Можно добавить использование getPhysicalScreenSize, если оно надежнее
-		// для получения ОС-актуального размера для mouse_move.
-		// w, h := getPhysicalScreenSize()
-		// if w == 0 || h == 0 { w, h = currentDisplayW, currentDisplayH }
 
-		tw := actualScreenWidth // Разрешение, которое мы сообщаем клиенту
+		tw := actualScreenWidth
 		th := actualScreenHeight
-		if tw == 0 || th == 0 { // Fallback, если вдруг глобальные размеры еще не установлены
+		if tw == 0 || th == 0 {
 			tw, th = currentDisplayW, currentDisplayH
 		}
 
-		// Вычисляем коэффициент масштабирования
 		scaleX := float64(currentDisplayW) / float64(tw)
 		scaleY := float64(currentDisplayH) / float64(th)
 
@@ -864,8 +757,6 @@ func handleControl(data []byte) {
 		robotgo.MoveMouse(safeX, safeY)
 
 	case "mouse_down", "mouse_up":
-		// robotgo ожидает "left", "middle", "right"
-		// Предполагаем, что "button" от 0 (left), 1 (middle), 2 (right)
 		btnF, ok := ctl["button"].(float64)
 		if !ok {
 			log.Println("[CONTROL] invalid button")
@@ -883,7 +774,7 @@ func handleControl(data []byte) {
 			robotgo.MouseUp(names[btn])
 		}
 
-	case "mouse_toggle": // Некоторые реализации могут посылать mouse_toggle
+	case "mouse_toggle":
 		btnF, ok := ctl["button"].(float64)
 		if !ok {
 			log.Println("[CONTROL] invalid button")
@@ -905,7 +796,7 @@ func handleControl(data []byte) {
 			robotgo.MouseUp(names[btn])
 		}
 
-	case "mouse_click": // Некоторые реализации могут посылать mouse_click
+	case "mouse_click":
 		btnF, ok := ctl["button"].(float64)
 		if !ok {
 			log.Println("[CONTROL] invalid button")
@@ -933,7 +824,7 @@ func handleControl(data []byte) {
 		}
 		robotgo.KeyUp(key_str)
 
-	case "key_press": // Для имитации однократного нажатия
+	case "key_press":
 		key_str, ok := ctl["key"].(string)
 		if !ok {
 			log.Println("[CONTROL] Key event missing 'key' field.")
@@ -946,7 +837,6 @@ func handleControl(data []byte) {
 	}
 }
 
-// clampInt ограничивает значение `v` между `min` и `max`.
 func clampInt(v, min, max int) int {
 	if v < min {
 		return min
@@ -957,7 +847,6 @@ func clampInt(v, min, max int) int {
 	return v
 }
 
-// startVideoStats выводит статистику видеопотока каждые 3 секунды
 func startVideoStats() {
 	go func() {
 		var prevBytes int64
@@ -991,15 +880,20 @@ func startVideoStats() {
 	}()
 }
 
-func formatBytes(n int64) string {
+// ИСПРАВЛЕНО #6: прежняя реализация делила на div уже после его инкремента
+// в теле цикла, что давало результат ~0 для любого значения.
+// Например: n=1500 → div начинает с 1024, цикл: 1500>=1024 → div=1048576,
+// результат: 1500/1048576 ≈ 0.001 KB (неверно).
+// Исправлено: цикл итерирует по уменьшающемуся n, div накапливает множитель.
+func formatBytes(b int64) string {
 	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
 	}
 	div, exp := int64(unit), 0
-	for n >= div {
+	for n := b / unit; n >= unit; n /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
