@@ -122,9 +122,6 @@ async def safe_send(ws: WebSocket, data: str) -> bool:
         return False
 
 
-# ИСПРАВЛЕНО #4: вместо отправки текстового "ping" (невалидный JSON,
-# вызывал ошибки разбора на клиентах) используются WebSocket ping-фреймы
-# протокольного уровня, которые не видны прикладному коду клиентов.
 async def cleanup_task():
     while True:
         await asyncio.sleep(30)

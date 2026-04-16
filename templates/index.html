@@ -1,9 +1,8 @@
-<!-- rmm/templates/index.html -->
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>RMM Viewer</title>
+    <title>RMM Viewer - Dual Channel</title>
     <style>
       html,
       body {
@@ -13,6 +12,7 @@
         height: 100%;
         background: #111;
         overflow: hidden;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
       }
 
       video {
@@ -31,6 +31,7 @@
         color: #0f0;
         font-family: monospace;
         font-size: 12px;
+        z-index: 1000;
       }
 
       .layout-indicator {
@@ -43,29 +44,131 @@
         padding: 2px 5px;
         background: rgba(0, 0, 0, 0.5);
         border-radius: 3px;
+        z-index: 1000;
+      }
+
+      .channel-status {
+        position: fixed;
+        left: 10px;
+        top: 10px;
+        color: #0f0;
+        font-family: monospace;
+        font-size: 10px;
+        background: rgba(0, 0, 0, 0.7);
+        padding: 5px;
+        border-radius: 3px;
+        z-index: 1000;
+      }
+
+      .controls {
+        position: fixed;
+        right: 10px;
+        top: 10px;
+        z-index: 1000;
+      }
+
+      .btn {
+        background: rgba(0, 128, 0, 0.8);
+        color: white;
+        border: none;
+        padding: 5px 10px;
+        margin: 2px;
+        border-radius: 3px;
+        cursor: pointer;
+        font-size: 10px;
+        font-family: monospace;
+      }
+
+      .btn:hover {
+        background: rgba(0, 180, 0, 0.9);
+      }
+
+      .btn:disabled {
+        background: rgba(128, 128, 128, 0.5);
+        cursor: not-allowed;
+      }
+
+      .screenshot-modal {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.9);
+        display: none;
+        z-index: 2000;
+        justify-content: center;
+        align-items: center;
+      }
+
+      .screenshot-content {
+        max-width: 90%;
+        max-height: 90%;
+        border: 2px solid #0f0;
+        border-radius: 5px;
+      }
+
+      .close-btn {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        background: #f00;
+        color: white;
+        border: none;
+        padding: 10px 15px;
+        border-radius: 3px;
+        cursor: pointer;
+        font-size: 12px;
       }
     </style>
   </head>
 
   <body>
     <video id="video" autoplay playsinline muted></video>
+
     <div id="status" class="status">Connecting...</div>
     <div id="layoutIndicator" class="layout-indicator">EN</div>
 
+    <div class="channel-status">
+      <div>Control: <span id="controlStatus">Disconnected</span></div>
+      <div>Binary: <span id="binaryStatus">Disconnected</span></div>
+      <div>Video: <span id="videoStatus">Waiting</span></div>
+    </div>
+
+    <div class="controls">
+      <button id="screenshotBtn" class="btn" disabled>Screenshot (F9)</button>
+      <button id="statsBtn" class="btn">Stats</button>
+    </div>
+
+    <!-- Screenshot Modal -->
+    <div id="screenshotModal" class="screenshot-modal">
+      <button class="close-btn" onclick="closeScreenshot()">Close (ESC)</button>
+      <img id="screenshotImg" class="screenshot-content" />
+    </div>
+
     <script>
-      let pc, ws, dc;
+      let pc, ws;
+      let controlChannel, binaryChannel;
       let remoteScreenWidth = 0;
       let remoteScreenHeight = 0;
       let currentWindow = { x: 0, y: 0, width: 0, height: 0, title: "" };
       let lastMouseMove = 0;
       let windowInfoRequestPending = false;
       const WINDOW_INFO_INTERVAL = 200;
-      const mouseMoveThrottle = 16; //ms, ~60fps
+      const mouseMoveThrottle = 16; // ms, ~60fps
       let currentLayout = "en"; // 'en' или 'ru'
+      let screenshotCounter = 0;
 
-      // ИСПРАВЛЕНО #3: удалены неиспользуемые переменные textBuffer,
-      // textBufferTimeout, TEXT_FLUSH_DELAY — textBuffer никогда не заполнялся,
-      // а type_string_input не обрабатывался на стороне агента.
+      // Status Elements
+      const statusEl = document.getElementById("status");
+      const controlStatusEl = document.getElementById("controlStatus");
+      const binaryStatusEl = document.getElementById("binaryStatus");
+      const videoStatusEl = document.getElementById("videoStatus");
+      const layoutIndicator = document.getElementById("layoutIndicator");
+      const video = document.getElementById("video");
+      const screenshotBtn = document.getElementById("screenshotBtn");
+      const screenshotModal = document.getElementById("screenshotModal");
+      const screenshotImg = document.getElementById("screenshotImg");
 
       // Кириллица -> латинские клавиши (для русской раскладки)
       const cyrillicToLatinMap = {
@@ -109,27 +212,50 @@
       // Блокируем контекстное меню
       document.addEventListener("contextmenu", (e) => e.preventDefault());
 
-      // Элементы DOM
-      const statusEl = document.getElementById("status");
-      const video = document.getElementById("video");
-      const layoutIndicator = document.getElementById("layoutIndicator");
-
-      // --- Helper-функции ---
+      // --- Helper Functions ---
       function setStatus(msg, color = "#0f0") {
         statusEl.textContent = msg;
         statusEl.style.color = color;
+      }
+
+      function setChannelStatus(channel, status, color = "#0f0") {
+        const el =
+          channel === "control"
+            ? controlStatusEl
+            : channel === "binary"
+              ? binaryStatusEl
+              : videoStatusEl;
+        el.textContent = status;
+        el.style.color = color;
       }
 
       function updateLayoutIndicator() {
         layoutIndicator.textContent = currentLayout === "ru" ? "RU" : "EN";
       }
 
-      function sendControl(type, payload) {
-        if (dc && dc.readyState === "open") {
+      function sendControl(type, payload = {}) {
+        if (controlChannel && controlChannel.readyState === "open") {
           try {
-            dc.send(JSON.stringify({ type, ...payload }));
+            const message = { type, ...payload };
+            controlChannel.send(JSON.stringify(message));
           } catch (e) {
             console.error("Failed to send control message:", e);
+          }
+        }
+      }
+
+      function sendBinary(messageType, payload = new Uint8Array()) {
+        if (binaryChannel && binaryChannel.readyState === "open") {
+          try {
+            const typeBytes = new TextEncoder().encode(
+              messageType.padEnd(4).slice(0, 4),
+            );
+            const message = new Uint8Array(typeBytes.length + payload.length);
+            message.set(typeBytes, 0);
+            message.set(payload, typeBytes.length);
+            binaryChannel.send(message);
+          } catch (e) {
+            console.error("Failed to send binary message:", e);
           }
         }
       }
@@ -138,23 +264,13 @@
         return Math.max(min, Math.min(max, v));
       }
 
-      // ИСПРАВЛЕНО #2 и #3: функция flushTextBuffer упрощена — убран
-      // неиспользуемый параметр и логика textBuffer.
-      function flushTextBuffer() {
-        // Зарезервировано для будущей буферизации ввода.
-      }
-
-      // ИСПРАВЛЕНО #1: пробел исключён из печатаемых клавиш.
-      // Прежде условие (e.key !== " " || e.code === "Space") было всегда true
-      // для пробела (false || true = true), поэтому пробел отправлялся как
-      // символ " ", а не как "space", что не работало в robotgo.
       function isPrintableKey(e) {
         return (
           e.key.length === 1 &&
           !e.ctrlKey &&
           !e.altKey &&
           !e.metaKey &&
-          e.key !== " " // Пробел — специальная клавиша, обрабатывается отдельно
+          e.key !== " " // Пробел — специальная клавиша
         );
       }
 
@@ -169,143 +285,80 @@
         }
 
         const code = e.code || "";
-        const key = e.key || "";
 
-        // Специальная обработка для пробела
         if (e.code === "Space") return "space";
 
-        switch (code) {
-          case "Enter":
-            return "enter";
-          case "Backspace":
-            return "backspace";
-          case "Tab":
-            return "tab";
-          case "Escape":
-            return "esc";
-          case "Delete":
-            return "delete";
-          case "Insert":
-            return "insert";
-          case "Home":
-            return "home";
-          case "End":
-            return "end";
-          case "PageUp":
-            return "pageup";
-          case "PageDown":
-            return "pagedown";
-          case "ArrowLeft":
-            return "left";
-          case "ArrowRight":
-            return "right";
-          case "ArrowUp":
-            return "up";
-          case "ArrowDown":
-            return "down";
-          case "ControlLeft":
-          case "ControlRight":
-            return "ctrl";
-          case "ShiftLeft":
-          case "ShiftRight":
-            return "shift";
-          case "AltLeft":
-          case "AltRight":
-            return "alt";
-          case "MetaLeft":
-          case "MetaRight":
-            return navigator.platform.startsWith("Mac") ? "command" : "win";
-          case "CapsLock":
-            return "capslock";
-          case "NumLock":
-            return "numlock";
-          case "ScrollLock":
-            return "scrolllock";
-          case "F1":
-            return "f1";
-          case "F2":
-            return "f2";
-          case "F3":
-            return "f3";
-          case "F4":
-            return "f4";
-          case "F5":
-            return "f5";
-          case "F6":
-            return "f6";
-          case "F7":
-            return "f7";
-          case "F8":
-            return "f8";
-          case "F9":
-            return "f9";
-          case "F10":
-            return "f10";
-          case "F11":
-            return "f11";
-          case "F12":
-            return "f12";
-          case "Numpad0":
-            return "0";
-          case "Numpad1":
-            return "1";
-          case "Numpad2":
-            return "2";
-          case "Numpad3":
-            return "3";
-          case "Numpad4":
-            return "4";
-          case "Numpad5":
-            return "5";
-          case "Numpad6":
-            return "6";
-          case "Numpad7":
-            return "7";
-          case "Numpad8":
-            return "8";
-          case "Numpad9":
-            return "9";
-          case "NumpadDecimal":
-            return "period";
-          case "NumpadAdd":
-            return "add";
-          case "NumpadSubtract":
-            return "minus";
-          case "NumpadMultiply":
-            return "multiply";
-          case "NumpadDivide":
-            return "divide";
-          case "NumpadEnter":
-            return "enter";
-          case "BracketLeft":
-            return "[";
-          case "BracketRight":
-            return "]";
-          case "Semicolon":
-            return ";";
-          case "Quote":
-            return "'";
-          case "Comma":
-            return ",";
-          case "Period":
-            return ".";
-          case "Slash":
-            return "/";
-          case "Backslash":
-            return "\\";
-          case "Equal":
-            return "=";
-          case "Minus":
-            return "-";
-          case "Backquote":
-            return "`";
-          default:
-            console.log(`[KEYBOARD] Unmapped key.code: ${code}, e.key: ${key}`);
-            return null;
-        }
+        const keyMap = {
+          Enter: "enter",
+          Backspace: "backspace",
+          Tab: "tab",
+          Escape: "esc",
+          Delete: "delete",
+          Insert: "insert",
+          Home: "home",
+          End: "end",
+          PageUp: "pageup",
+          PageDown: "pagedown",
+          ArrowLeft: "left",
+          ArrowRight: "right",
+          ArrowUp: "up",
+          ArrowDown: "down",
+          ControlLeft: "ctrl",
+          ControlRight: "ctrl",
+          ShiftLeft: "shift",
+          ShiftRight: "shift",
+          AltLeft: "alt",
+          AltRight: "alt",
+          MetaLeft: navigator.platform.startsWith("Mac") ? "command" : "win",
+          MetaRight: navigator.platform.startsWith("Mac") ? "command" : "win",
+          CapsLock: "capslock",
+          NumLock: "numlock",
+          ScrollLock: "scrolllock",
+          F1: "f1",
+          F2: "f2",
+          F3: "f3",
+          F4: "f4",
+          F5: "f5",
+          F6: "f6",
+          F7: "f7",
+          F8: "f8",
+          F9: "f9",
+          F10: "f10",
+          F11: "f11",
+          F12: "f12",
+          Numpad0: "0",
+          Numpad1: "1",
+          Numpad2: "2",
+          Numpad3: "3",
+          Numpad4: "4",
+          Numpad5: "5",
+          Numpad6: "6",
+          Numpad7: "7",
+          Numpad8: "8",
+          Numpad9: "9",
+          NumpadDecimal: "period",
+          NumpadAdd: "add",
+          NumpadSubtract: "minus",
+          NumpadMultiply: "multiply",
+          NumpadDivide: "divide",
+          NumpadEnter: "enter",
+          BracketLeft: "[",
+          BracketRight: "]",
+          Semicolon: ";",
+          Quote: "'",
+          Comma: ",",
+          Period: ".",
+          Slash: "/",
+          Backslash: "\\",
+          Equal: "=",
+          Minus: "-",
+          Backquote: "`",
+        };
+
+        return keyMap[code] || null;
       }
 
-      // --- WebSocket и WebRTC соединения ---
+      // --- WebSocket and WebRTC Connection ---
       async function connect() {
         const addr =
           "ws://" + window.location.hostname + ":8000/ws/viewer/agent1";
@@ -315,16 +368,19 @@
           console.log("WebSocket connected to", addr);
           setStatus("Connected");
 
-          if (pc) {
-            pc.close();
-          }
+          if (pc) pc.close();
+
           pc = new RTCPeerConnection({
             iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
           });
 
-          dc = pc.createDataChannel("control");
-          setupDataChannel(dc);
-          setupConnection(pc);
+          // Create both DataChannels
+          controlChannel = pc.createDataChannel("control", { ordered: true });
+          binaryChannel = pc.createDataChannel("binary", { ordered: true });
+
+          setupControlChannel(controlChannel);
+          setupBinaryChannel(binaryChannel);
+          setupPeerConnection(pc);
 
           try {
             const offer = await pc.createOffer();
@@ -354,9 +410,10 @@
         ws.onclose = () => {
           console.warn("WebSocket disconnected. Retrying in 2 seconds...");
           setStatus("Reconnecting...", "#f90");
-          if (pc) {
-            pc.close();
-          }
+          setChannelStatus("control", "Disconnected", "#f90");
+          setChannelStatus("binary", "Disconnected", "#f90");
+          setChannelStatus("video", "Disconnected", "#f90");
+          if (pc) pc.close();
           setTimeout(connect, 2000);
         };
 
@@ -367,34 +424,97 @@
         };
       }
 
-      function setupDataChannel(channel) {
+      function setupControlChannel(channel) {
         channel.onopen = () => {
-          setStatus("Ready");
-          console.log("DataChannel 'control' opened.");
-          sendControl("request_screen_info", {});
+          setStatus("Control Ready");
+          setChannelStatus("control", "Connected", "#0f0");
+          screenshotBtn.disabled = false;
+          console.log("Control DataChannel opened");
+          sendControl("request_screen_info");
         };
-        channel.onclose = () => {
-          setStatus("Disconnected", "#f66");
-          console.log("DataChannel 'control' closed.");
-          flushTextBuffer(); // ИСПРАВЛЕНО #2: убран лишний аргумент true
-        };
-        channel.onerror = (e) =>
-          console.error("DataChannel 'control' error:", e);
 
         channel.onmessage = (e) => {
-          let data;
           try {
-            data = JSON.parse(e.data);
-          } catch (parseErr) {
-            console.warn(
-              "Failed to parse DataChannel message:",
-              parseErr,
-              e.data,
-            );
-            return;
+            const data = JSON.parse(e.data);
+            handleControlMessage(data);
+          } catch (err) {
+            console.warn("Failed to parse control message:", err, e.data);
           }
+        };
 
-          if (data.type === "screen_info") {
+        channel.onclose = () => {
+          setChannelStatus("control", "Disconnected", "#f66");
+          screenshotBtn.disabled = true;
+          console.log("Control DataChannel closed");
+        };
+
+        channel.onerror = (e) => {
+          console.error("Control DataChannel error:", e);
+          setChannelStatus("control", "Error", "#f00");
+        };
+      }
+
+      function setupBinaryChannel(channel) {
+        channel.binaryType = "arraybuffer";
+
+        channel.onopen = () => {
+          setChannelStatus("binary", "Connected", "#0f0");
+          console.log("Binary DataChannel opened");
+        };
+
+        channel.onmessage = (e) => {
+          handleBinaryMessage(e.data);
+        };
+
+        channel.onclose = () => {
+          setChannelStatus("binary", "Disconnected", "#f66");
+          console.log("Binary DataChannel closed");
+        };
+
+        channel.onerror = (e) => {
+          console.error("Binary DataChannel error:", e);
+          setChannelStatus("binary", "Error", "#f00");
+        };
+      }
+
+      function setupPeerConnection(pcInstance) {
+        pcInstance.ontrack = (e) => {
+          if (video.srcObject !== e.streams[0]) {
+            video.srcObject = e.streams[0];
+            setChannelStatus("video", "Streaming", "#0f0");
+            console.log("Received remote video stream");
+          }
+        };
+
+        pcInstance.onicecandidate = (e) => {
+          if (e.candidate) {
+            ws.send(JSON.stringify(e.candidate));
+          }
+        };
+
+        pcInstance.onconnectionstatechange = () => {
+          console.log("Peer Connection State:", pcInstance.connectionState);
+          const state = pcInstance.connectionState;
+
+          if (state === "connected") {
+            setStatus("Full Connected", "#0f0");
+          } else if (state === "failed" || state === "closed") {
+            setStatus("Connection Lost", "#f00");
+            setChannelStatus("video", "Disconnected", "#f00");
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.close();
+            }
+          } else if (state === "connecting") {
+            setStatus("Connecting...", "#ff0");
+          }
+        };
+
+        pcInstance.addTransceiver("video", { direction: "recvonly" });
+      }
+
+      function handleControlMessage(data) {
+        switch (data.type) {
+          case "screen_info":
             remoteScreenWidth = data.width;
             remoteScreenHeight = data.height;
             console.log(
@@ -404,7 +524,9 @@
               remoteScreenHeight,
             );
             syncVideoDimensions();
-          } else if (data.type === "window_info") {
+            break;
+
+          case "window_info":
             windowInfoRequestPending = false;
             currentWindow = {
               x: data.x,
@@ -416,45 +538,59 @@
             console.log(
               "Received Window Info:",
               currentWindow.title,
-              currentWindow.width,
-              "x",
-              currentWindow.height,
-              "at",
-              currentWindow.x,
-              ",",
-              currentWindow.y,
+              currentWindow.width + "x" + currentWindow.height,
             );
-          }
-        };
+            break;
+
+          default:
+            console.log("Unknown control message type:", data.type);
+        }
       }
 
-      function setupConnection(pcInstance) {
-        pcInstance.ontrack = (e) => {
-          if (video.srcObject !== e.streams[0]) {
-            video.srcObject = e.streams[0];
-            console.log("Received remote stream.");
-          }
-        };
-        pcInstance.onicecandidate = (e) => {
-          if (e.candidate) {
-            ws.send(JSON.stringify(e.candidate));
-          }
-        };
-        pcInstance.onconnectionstatechange = () => {
-          console.log("Peer Connection State:", pcInstance.connectionState);
-          if (
-            pcInstance.connectionState === "failed" ||
-            pcInstance.connectionState === "closed"
-          ) {
-            setStatus("Connection Lost", "#f00");
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.close();
-            }
-          }
-        };
-        pcInstance.addTransceiver("video", { direction: "recvonly" });
+      function handleBinaryMessage(arrayBuffer) {
+        const data = new Uint8Array(arrayBuffer);
+        if (data.length < 4) {
+          console.warn("Binary message too short");
+          return;
+        }
+
+        const msgType = String.fromCharCode(...data.slice(0, 4));
+        const payload = data.slice(4);
+
+        switch (msgType) {
+          case "SCRN":
+            handleScreenshotData(payload);
+            break;
+          case "FILE":
+            handleFileData(payload);
+            break;
+          default:
+            console.log("Unknown binary message type:", msgType);
+        }
       }
 
+      function handleScreenshotData(data) {
+        screenshotCounter++;
+        console.log(
+          `Received screenshot #${screenshotCounter}, size: ${data.length} bytes`,
+        );
+
+        const blob = new Blob([data], { type: "image/png" });
+        const url = URL.createObjectURL(blob);
+
+        screenshotImg.src = url;
+        screenshotModal.style.display = "flex";
+
+        // Auto cleanup URL after some time
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+      }
+
+      function handleFileData(data) {
+        console.log("Received file data:", data.length, "bytes");
+        // Handle file transfers here
+      }
+
+      // --- Mouse and Video Handling ---
       function syncVideoDimensions() {
         if (video.videoWidth && video.videoHeight) {
           if (
@@ -471,7 +607,7 @@
               "x",
               remoteScreenHeight,
             );
-            sendControl("request_screen_info", {});
+            sendControl("request_screen_info");
           }
         }
       }
@@ -482,7 +618,7 @@
       function mapPointerToRemote(clientX, clientY) {
         if (remoteScreenWidth <= 0 || remoteScreenHeight <= 0) {
           console.warn(
-            "Remote screen dimensions not available for mouse mapping.",
+            "Remote screen dimensions not available for mouse mapping",
           );
           return null;
         }
@@ -570,6 +706,7 @@
         return null;
       }
 
+      // Mouse Event Handlers
       video.addEventListener("mouseleave", () => {
         video.style.cursor = "default";
       });
@@ -597,27 +734,33 @@
         }),
       );
 
-      // Обработка событий клавиатуры
+      // Keyboard Event Handlers
       window.addEventListener("keydown", (e) => {
-        if (!dc || dc.readyState !== "open") return;
+        if (!controlChannel || controlChannel.readyState !== "open") return;
 
-        // ИСПРАВЛЕНО #1: isPrintableKey теперь исключает пробел,
-        // поэтому пробел попадает в ветку mapKeyEventToRobotKey → "space".
-        if (isPrintableKey(e) && e.key.length === 1) {
-          let latKey = e.key;
+        // F9 for screenshot
+        if (e.key === "F9") {
+          e.preventDefault();
+          requestScreenshot();
+          return;
+        }
 
-          // Преобразуем кириллические символы в латинские
-          if (/[а-яёА-ЯЁ]/.test(latKey)) {
-            latKey = cyrillicToLatinMap[latKey.toLowerCase()] || latKey;
-          }
-
-          sendControl("key_down", { key: latKey });
+        // Escape to close screenshot
+        if (e.key === "Escape" && screenshotModal.style.display === "flex") {
+          closeScreenshot();
           e.preventDefault();
           return;
         }
 
-        // Обработка специальных клавиш (включая пробел)
-        flushTextBuffer();
+        if (isPrintableKey(e) && e.key.length === 1) {
+          let latKey = e.key;
+          if (/[а-яёА-ЯЁ]/.test(latKey)) {
+            latKey = cyrillicToLatinMap[latKey.toLowerCase()] || latKey;
+          }
+          sendControl("key_down", { key: latKey });
+          e.preventDefault();
+          return;
+        }
 
         const robotKey = mapKeyEventToRobotKey(e);
         if (robotKey) {
@@ -629,7 +772,7 @@
       });
 
       window.addEventListener("keyup", (e) => {
-        if (!dc || dc.readyState !== "open") return;
+        if (!controlChannel || controlChannel.readyState !== "open") return;
 
         if (
           isPrintableKey(e) &&
@@ -651,11 +794,7 @@
         }
       });
 
-      window.addEventListener("blur", () => {
-        flushTextBuffer();
-      });
-
-      // Переключение раскладки по Ctrl+Shift
+      // Layout switching (Ctrl+Shift)
       window.addEventListener("keydown", (e) => {
         if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
           currentLayout = currentLayout === "ru" ? "en" : "ru";
@@ -664,14 +803,63 @@
         }
       });
 
-      // Инициализация
+      // --- UI Functions ---
+      function requestScreenshot() {
+        if (!binaryChannel || binaryChannel.readyState !== "open") {
+          console.warn("Binary channel not available for screenshot");
+          return;
+        }
+
+        console.log("Requesting screenshot...");
+        sendBinary("SCRN", new TextEncoder().encode("REQUEST"));
+      }
+
+      function closeScreenshot() {
+        screenshotModal.style.display = "none";
+        if (screenshotImg.src) {
+          URL.revokeObjectURL(screenshotImg.src);
+          screenshotImg.src = "";
+        }
+      }
+
+      function showStats() {
+        const stats = {
+          remoteScreenWidth,
+          remoteScreenHeight,
+          currentWindow,
+          screenshotCounter,
+          controlChannelState: controlChannel?.readyState || "null",
+          binaryChannelState: binaryChannel?.readyState || "null",
+          videoState: video.srcObject ? "active" : "none",
+        };
+
+        alert("RMM Stats:\n" + JSON.stringify(stats, null, 2));
+      }
+
+      // Event Listeners
+      screenshotBtn.addEventListener("click", requestScreenshot);
+      document.getElementById("statsBtn").addEventListener("click", showStats);
+
+      // Close screenshot on click outside
+      screenshotModal.addEventListener("click", (e) => {
+        if (e.target === screenshotModal) {
+          closeScreenshot();
+        }
+      });
+
+      // Initialize
       updateLayoutIndicator();
       connect();
 
+      // Window info polling
       setInterval(() => {
-        if (dc && dc.readyState === "open" && !windowInfoRequestPending) {
+        if (
+          controlChannel &&
+          controlChannel.readyState === "open" &&
+          !windowInfoRequestPending
+        ) {
           windowInfoRequestPending = true;
-          sendControl("request_window_info", {});
+          sendControl("request_window_info");
         }
       }, WINDOW_INFO_INTERVAL);
     </script>

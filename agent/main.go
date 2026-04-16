@@ -3,9 +3,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/png"
 	"io"
 	"log"
 	"os"
@@ -17,7 +19,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
 	"unsafe"
 
 	"github.com/go-vgo/robotgo"
@@ -47,8 +48,6 @@ var (
 	setDPIAware        = user32.NewProc("SetProcessDPIAware")
 	actualScreenWidth  int
 	actualScreenHeight int
-	activeDataChannel  *webrtc.DataChannel
-	dcMutex            sync.RWMutex
 	resolutionUpdates  = make(chan [2]int, 1)
 	reResolution       = regexp.MustCompile(`(\d{3,5})x(\d{3,5})`)
 
@@ -69,11 +68,17 @@ var (
 	getWindowText       = user32.NewProc("GetWindowTextW")
 	getWindowTextLength = user32.NewProc("GetWindowTextLengthW")
 
-	// ИСПРАВЛЕНО #10: комментарий перенесён к объявлению переменной.
-	// currentFFmpegCmd хранит ссылку на последний запущенный exec.Cmd FFmpeg.
-	// Доступ к нему должен быть синхронизирован через ffmpegMutex.
 	currentFFmpegCmd *exec.Cmd
 )
+
+// --- Channel Manager ---
+type ChannelManager struct {
+	controlChannel *webrtc.DataChannel
+	binaryChannel  *webrtc.DataChannel
+	mutex          sync.RWMutex
+}
+
+var channelManager = &ChannelManager{}
 
 func initWindowsDPI() {
 	setDPIAware.Call()
@@ -104,6 +109,10 @@ type WindowInfo struct {
 }
 
 func getPhysicalScreenSize() (int, int) {
+	if runtime.GOOS != "windows" {
+		return robotgo.GetScreenSize()
+	}
+
 	hwnd, _, _ := getDesktopWindow.Call()
 	if hwnd == 0 {
 		return 0, 0
@@ -135,25 +144,69 @@ func getPhysicalScreenSize() (int, int) {
 	return width, height
 }
 
-func sendScreenInfo(dc *webrtc.DataChannel) {
+// --- Channel Management Functions ---
+func sendControlMessage(data map[string]interface{}) error {
+	channelManager.mutex.RLock()
+	dc := channelManager.controlChannel
+	channelManager.mutex.RUnlock()
+
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return fmt.Errorf("control channel not available")
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("json marshal error: %v", err)
+	}
+
+	return dc.SendText(string(jsonData))
+}
+
+func sendBinaryData(messageType string, payload []byte) error {
+	channelManager.mutex.RLock()
+	dc := channelManager.binaryChannel
+	channelManager.mutex.RUnlock()
+
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return fmt.Errorf("binary channel not available")
+	}
+
+	// Ensure message type is exactly 4 bytes
+	typeBytes := []byte(messageType)
+	if len(typeBytes) < 4 {
+		typeBytes = append(typeBytes, make([]byte, 4-len(typeBytes))...)
+	} else if len(typeBytes) > 4 {
+		typeBytes = typeBytes[:4]
+	}
+
+	message := append(typeBytes, payload...)
+	return dc.Send(message)
+}
+
+func sendScreenInfo() {
 	w, h := getPhysicalScreenSize()
 	if w == 0 || h == 0 {
 		w, h = detectResolution()
 	}
+
 	info := map[string]interface{}{
 		"type":   "screen_info",
 		"width":  w,
 		"height": h,
 	}
-	b, _ := json.Marshal(info)
-	err := dc.SendText(string(b))
-	if err != nil {
-		log.Printf("[ERROR] Failed to send screen_info via DataChannel: %v", err)
+
+	if err := sendControlMessage(info); err != nil {
+		log.Printf("[ERROR] Failed to send screen_info: %v", err)
+	} else {
+		log.Printf("[SCREEN] Sent screen_info: %dx%d", w, h)
 	}
-	log.Printf("[SCREEN] Reported size: %dx%d", w, h)
 }
 
 func getForegroundWindowInfo() WindowInfo {
+	if runtime.GOOS != "windows" {
+		return WindowInfo{IsValid: false}
+	}
+
 	hwnd, _, _ := getForegroundWindow.Call()
 	if hwnd == 0 {
 		return WindowInfo{IsValid: false}
@@ -184,14 +237,12 @@ func getForegroundWindowInfo() WindowInfo {
 	}
 }
 
-func sendWindowInfo(dc *webrtc.DataChannel) {
-	if runtime.GOOS != "windows" {
-		return
-	}
+func sendWindowInfo() {
 	wi := getForegroundWindowInfo()
 	if !wi.IsValid {
 		return
 	}
+
 	info := map[string]interface{}{
 		"type":   "window_info",
 		"title":  wi.Title,
@@ -200,10 +251,9 @@ func sendWindowInfo(dc *webrtc.DataChannel) {
 		"width":  wi.Width,
 		"height": wi.Height,
 	}
-	b, _ := json.Marshal(info)
-	err := dc.SendText(string(b))
-	if err != nil {
-		log.Printf("[ERROR] Failed to send window_info via DataChannel: %v", err)
+
+	if err := sendControlMessage(info); err != nil {
+		log.Printf("[ERROR] Failed to send window_info: %v", err)
 	}
 }
 
@@ -230,10 +280,60 @@ func detectResolution() (int, int) {
 	return w, h
 }
 
-// --- Основной запуск ---
+// --- Screenshot Functions ---
+func captureScreenshot() ([]byte, error) {
+	log.Println("[SCREENSHOT] Starting screen capture...")
+	
+	bitmap := robotgo.CaptureScreen()
+	if bitmap == nil {
+		return nil, fmt.Errorf("failed to capture screen")
+	}
+	defer robotgo.FreeBitmap(bitmap)
+
+	img := robotgo.ToImage(bitmap)
+	if img == nil {
+		return nil, fmt.Errorf("failed to convert bitmap to image")
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, fmt.Errorf("failed to encode PNG: %v", err)
+	}
+
+	log.Printf("[SCREENSHOT] Captured screenshot: %d bytes", buf.Len())
+	return buf.Bytes(), nil
+}
+
+func handleScreenshotRequest(payload []byte) {
+	log.Println("[BINARY] Processing screenshot request...")
+	
+	screenshot, err := captureScreenshot()
+	if err != nil {
+		log.Printf("[BINARY] Screenshot error: %v", err)
+		// Send error response
+		errorMsg := fmt.Sprintf("ERROR: %v", err)
+		if err := sendBinaryData("SCRN", []byte(errorMsg)); err != nil {
+			log.Printf("[BINARY] Failed to send screenshot error: %v", err)
+		}
+		return
+	}
+
+	if err := sendBinaryData("SCRN", screenshot); err != nil {
+		log.Printf("[BINARY] Failed to send screenshot: %v", err)
+	} else {
+		log.Printf("[BINARY] Screenshot sent successfully: %d bytes", len(screenshot))
+	}
+}
+
+func handleFileTransfer(payload []byte) {
+	log.Printf("[BINARY] File transfer not implemented yet, received %d bytes", len(payload))
+}
+
+// --- Main Functions ---
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("Starting agent and connecting to signaling server: %s\n", serverURL)
+	log.Printf("Starting RMM agent with dual-channel support...")
+	log.Printf("Connecting to signaling server: %s\n", serverURL)
 
 	for i := 0; i < websocketMaxRetries; i++ {
 		log.Printf("Attempt %d of %d to connect to WebSocket server...", i+1, websocketMaxRetries)
@@ -307,23 +407,15 @@ func runAgent() error {
 				log.Println("[FFmpeg] Restart signal already pending, skipping.")
 			}
 
-			// ИСПРАВЛЕНО #8: используем локальную переменную dc (прочитанную
-			// под мьютексом), а не activeDataChannel напрямую.
-			dcMutex.RLock()
-			dc := activeDataChannel
-			dcMutex.RUnlock()
-
-			if dc != nil {
-				info := map[string]interface{}{
-					"type":   "screen_info",
-					"width":  res[0],
-					"height": res[1],
-				}
-				b, _ := json.Marshal(info)
-				err := dc.SendText(string(b)) // ИСПРАВЛЕНО #8
-				if err != nil {
-					log.Printf("[ERROR] Failed to send updated screen_info via DataChannel: %v", err)
-				}
+			// Send updated screen info
+			info := map[string]interface{}{
+				"type":   "screen_info",
+				"width":  res[0],
+				"height": res[1],
+			}
+			if err := sendControlMessage(info); err != nil {
+				log.Printf("[ERROR] Failed to send updated screen_info: %v", err)
+			} else {
 				log.Printf("[FFmpeg] Sent updated screen_info: %dx%d", res[0], res[1])
 			}
 		}
@@ -345,6 +437,180 @@ func runAgent() error {
 	}
 }
 
+// --- WebRTC Setup ---
+func newPeerConnection(out chan []byte, videoTrack *webrtc.TrackLocalStaticSample) (*webrtc.PeerConnection, error) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := pc.AddTrack(videoTrack); err != nil {
+		log.Printf("AddTrack error: %v", err)
+	}
+
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		channelManager.mutex.Lock()
+		defer channelManager.mutex.Unlock()
+
+		switch dc.Label() {
+		case "control":
+			channelManager.controlChannel = dc
+			setupControlChannel(dc)
+			log.Println("[DATACHANNEL] Control channel established")
+
+		case "binary":
+			channelManager.binaryChannel = dc
+			setupBinaryChannel(dc)
+			log.Println("[DATACHANNEL] Binary channel established")
+
+		default:
+			log.Printf("[DATACHANNEL] Unknown channel: %s", dc.Label())
+		}
+	})
+
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c != nil {
+			if payload, err := json.Marshal(c.ToJSON()); err == nil {
+				out <- payload
+			}
+		}
+	})
+
+	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		log.Printf("Peer Connection State has changed to %s\n", s.String())
+		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
+			log.Printf("PeerConnection %s, detaching channels.", s.String())
+			channelManager.mutex.Lock()
+			channelManager.controlChannel = nil
+			channelManager.binaryChannel = nil
+			channelManager.mutex.Unlock()
+		}
+	})
+
+	return pc, nil
+}
+
+func setupControlChannel(dc *webrtc.DataChannel) {
+	dc.OnOpen(func() {
+		log.Println("[CONTROL] DataChannel opened")
+		sendScreenInfo()
+	})
+
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		handleControlMessage(msg.Data)
+	})
+
+	dc.OnClose(func() {
+		log.Println("[CONTROL] DataChannel closed")
+		channelManager.mutex.Lock()
+		channelManager.controlChannel = nil
+		channelManager.mutex.Unlock()
+	})
+
+	dc.OnError(func(err error) {
+		log.Printf("[CONTROL] DataChannel error: %v", err)
+	})
+}
+
+func setupBinaryChannel(dc *webrtc.DataChannel) {
+	dc.OnOpen(func() {
+		log.Println("[BINARY] DataChannel opened")
+	})
+
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		handleBinaryMessage(msg.Data)
+	})
+
+	dc.OnClose(func() {
+		log.Println("[BINARY] DataChannel closed")
+		channelManager.mutex.Lock()
+		channelManager.binaryChannel = nil
+		channelManager.mutex.Unlock()
+	})
+
+	dc.OnError(func(err error) {
+		log.Printf("[BINARY] DataChannel error: %v", err)
+	})
+}
+
+func handleBinaryMessage(data []byte) {
+	if len(data) < 4 {
+		log.Printf("[BINARY] Message too short: %d bytes", len(data))
+		return
+	}
+
+	msgType := string(data[:4])
+	payload := data[4:]
+
+	log.Printf("[BINARY] Received message type: '%s', payload: %d bytes", msgType, len(payload))
+
+	switch strings.TrimSpace(msgType) {
+	case "SCRN":
+		handleScreenshotRequest(payload)
+	case "FILE":
+		handleFileTransfer(payload)
+	default:
+		log.Printf("[BINARY] Unknown message type: '%s'", msgType)
+	}
+}
+
+// --- SDP/ICE Handling ---
+func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnection,
+	lock *sync.Mutex, videoTrack *webrtc.TrackLocalStaticSample) bool {
+
+	var sdp webrtc.SessionDescription
+	if err := json.Unmarshal(msg, &sdp); err != nil || sdp.Type != webrtc.SDPTypeOffer {
+		return false
+	}
+
+	lock.Lock()
+	if old, ok := pcs["viewer"]; ok {
+		log.Printf("Closing old PeerConnection for 'viewer'.")
+		_ = old.Close()
+	}
+	pc, err := newPeerConnection(out, videoTrack)
+	if err != nil {
+		lock.Unlock()
+		log.Printf("PeerConnection error: %v", err)
+		return true
+	}
+	pcs["viewer"] = pc
+	lock.Unlock()
+
+	_ = pc.SetRemoteDescription(sdp)
+
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		log.Printf("CreateAnswer error: %v", err)
+		return true
+	}
+	_ = pc.SetLocalDescription(answer)
+	payload, _ := json.Marshal(answer)
+	out <- payload
+
+	return true
+}
+
+func handleICE(msg []byte, pcs map[string]*webrtc.PeerConnection, lock *sync.Mutex) {
+	var ice webrtc.ICECandidateInit
+	if err := json.Unmarshal(msg, &ice); err != nil || ice.Candidate == "" {
+		return
+	}
+	lock.Lock()
+	defer lock.Unlock()
+	for _, pc := range pcs {
+		if pc.RemoteDescription() != nil {
+			err := pc.AddICECandidate(ice)
+			if err != nil {
+				log.Printf("AddICECandidate error: %v", err)
+			}
+		}
+	}
+}
+
+// --- FFmpeg Management ---
 func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 	for {
 		log.Println("[FFmpeg Manager] Starting new FFmpeg process cycle...")
@@ -374,7 +640,6 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 			args = append(args, "-s", fmt.Sprintf("%dx%d", actualScreenWidth, actualScreenHeight))
 		}
 
-		// ИСПРАВЛЕНО #5: удалён дублирующийся флаг "-tune zerolatency".
 		args = append(args,
 			"-vcodec", "libx264", "-preset", "ultrafast",
 			"-tune", "zerolatency",
@@ -406,9 +671,6 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 			close(quitSignal)
 			continue
 		}
-		// ИСПРАВЛЕНО #9: parseFFmpegResolution никогда не вызывалась —
-		// stderr просто отбрасывается. Функция parseFFmpegResolution удалена
-		// как мёртвый код.
 		go func() { io.Copy(io.Discard, stderr) }()
 
 		if err = cmd.Start(); err != nil {
@@ -473,118 +735,6 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 	}
 }
 
-// --- SDP/ICE ---
-func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnection,
-	lock *sync.Mutex, videoTrack *webrtc.TrackLocalStaticSample) bool {
-
-	var sdp webrtc.SessionDescription
-	if err := json.Unmarshal(msg, &sdp); err != nil || sdp.Type != webrtc.SDPTypeOffer {
-		return false
-	}
-
-	lock.Lock()
-	if old, ok := pcs["viewer"]; ok {
-		log.Printf("Closing old PeerConnection for 'viewer'.")
-		_ = old.Close()
-	}
-	pc, err := newPeerConnection(out, videoTrack)
-	if err != nil {
-		lock.Unlock()
-		log.Printf("PeerConnection error: %v", err)
-		return true
-	}
-	pcs["viewer"] = pc
-	lock.Unlock()
-
-	_ = pc.SetRemoteDescription(sdp)
-
-	answer, err := pc.CreateAnswer(nil)
-	if err != nil {
-		log.Printf("CreateAnswer error: %v", err)
-		return true
-	}
-	_ = pc.SetLocalDescription(answer)
-	payload, _ := json.Marshal(answer)
-	out <- payload
-
-	return true
-}
-
-func newPeerConnection(out chan []byte,
-	videoTrack *webrtc.TrackLocalStaticSample) (*webrtc.PeerConnection, error) {
-
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := pc.AddTrack(videoTrack); err != nil {
-		log.Printf("AddTrack error: %v", err)
-	}
-
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		// ИСПРАВЛЕНО #7: запись activeDataChannel защищена мьютексом.
-		dcMutex.Lock()
-		activeDataChannel = dc
-		dcMutex.Unlock()
-
-		dc.OnOpen(func() {
-			log.Println("DataChannel opened")
-			sendScreenInfo(dc)
-		})
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			handleControl(msg.Data)
-		})
-		dc.OnClose(func() {
-			log.Println("DataChannel closed")
-			// ИСПРАВЛЕНО #7: обнуление activeDataChannel защищено мьютексом.
-			dcMutex.Lock()
-			activeDataChannel = nil
-			dcMutex.Unlock()
-		})
-	})
-
-	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c != nil {
-			if payload, err := json.Marshal(c.ToJSON()); err == nil {
-				out <- payload
-			}
-		}
-	})
-
-	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("Peer Connection State has changed to %s\n", s.String())
-		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
-			log.Printf("PeerConnection %s, detaching activeDataChannel.", s.String())
-			// ИСПРАВЛЕНО #7: обнуление activeDataChannel защищено мьютексом.
-			dcMutex.Lock()
-			activeDataChannel = nil
-			dcMutex.Unlock()
-		}
-	})
-
-	return pc, nil
-}
-
-func handleICE(msg []byte, pcs map[string]*webrtc.PeerConnection, lock *sync.Mutex) {
-	var ice webrtc.ICECandidateInit
-	if err := json.Unmarshal(msg, &ice); err != nil || ice.Candidate == "" {
-		return
-	}
-	lock.Lock()
-	defer lock.Unlock()
-	for _, pc := range pcs {
-		if pc.RemoteDescription() != nil {
-			err := pc.AddICECandidate(ice)
-			if err != nil {
-				log.Printf("AddICECandidate error: %v", err)
-			}
-		}
-	}
-}
-
 func startScreenWatcher() {
 	go func() {
 		prevW, prevH := actualScreenWidth, actualScreenHeight
@@ -608,22 +758,14 @@ func startScreenWatcher() {
 					log.Println("[SCREEN] Restart signal already pending from screen watcher, skipping.")
 				}
 
-				// ИСПРАВЛЕНО #8: используем локальную переменную dc.
-				dcMutex.RLock()
-				dc := activeDataChannel
-				dcMutex.RUnlock()
-
-				if dc != nil {
-					info := map[string]interface{}{
-						"type":   "screen_info",
-						"width":  w,
-						"height": h,
-					}
-					b, _ := json.Marshal(info)
-					err := dc.SendText(string(b)) // ИСПРАВЛЕНО #8
-					if err != nil {
-						log.Printf("[ERROR] Failed to send screen_info via DataChannel: %v", err)
-					}
+				info := map[string]interface{}{
+					"type":   "screen_info",
+					"width":  w,
+					"height": h,
+				}
+				if err := sendControlMessage(info); err != nil {
+					log.Printf("[ERROR] Failed to send screen_info: %v", err)
+				} else {
 					log.Printf("[SCREEN] Sent updated screen_info: %dx%d", w, h)
 				}
 			}
@@ -703,8 +845,8 @@ func findStartCode(data []byte) int {
 	return -1
 }
 
-// --- Управление вводом ---
-func handleControl(data []byte) {
+// --- Input Control ---
+func handleControlMessage(data []byte) {
 	var ctl map[string]interface{}
 	if err := json.Unmarshal(data, &ctl); err != nil {
 		log.Printf("[CONTROL] bad json: %v", err)
@@ -715,25 +857,10 @@ func handleControl(data []byte) {
 
 	switch t {
 	case "request_screen_info":
-		// ИСПРАВЛЕНО #8: используем локальную переменную dc вместо повторного
-		// обращения к activeDataChannel после освобождения мьютекса.
-		dcMutex.RLock()
-		dc := activeDataChannel
-		dcMutex.RUnlock()
-
-		if dc != nil {
-			sendScreenInfo(dc) // ИСПРАВЛЕНО #8
-		}
+		sendScreenInfo()
 
 	case "request_window_info":
-		// ИСПРАВЛЕНО #8: аналогично.
-		dcMutex.RLock()
-		dc := activeDataChannel
-		dcMutex.RUnlock()
-
-		if dc != nil {
-			sendWindowInfo(dc) // ИСПРАВЛЕНО #8
-		}
+		sendWindowInfo()
 
 	case "mouse_move":
 		x, okX := ctl["x"].(float64)
@@ -774,40 +901,6 @@ func handleControl(data []byte) {
 			robotgo.MouseUp(names[btn])
 		}
 
-	case "mouse_toggle":
-		btnF, ok := ctl["button"].(float64)
-		if !ok {
-			log.Println("[CONTROL] invalid button")
-			return
-		}
-		btn := int(btnF)
-		state, ok := ctl["state"].(string)
-		if !ok {
-			return
-		}
-		names := []string{"left", "middle", "right"}
-		if btn < 0 || btn >= len(names) {
-			log.Printf("[CONTROL] Unknown mouse button: %d", btn)
-			return
-		}
-		if state == "down" {
-			robotgo.MouseDown(names[btn])
-		} else if state == "up" {
-			robotgo.MouseUp(names[btn])
-		}
-
-	case "mouse_click":
-		btnF, ok := ctl["button"].(float64)
-		if !ok {
-			log.Println("[CONTROL] invalid button")
-			return
-		}
-		btn := int(btnF)
-		names := []string{"left", "middle", "right"}
-		if btn >= 0 && btn < len(names) {
-			robotgo.Click(names[btn])
-		}
-
 	case "key_down":
 		key_str, ok := ctl["key"].(string)
 		if !ok {
@@ -823,14 +916,6 @@ func handleControl(data []byte) {
 			return
 		}
 		robotgo.KeyUp(key_str)
-
-	case "key_press":
-		key_str, ok := ctl["key"].(string)
-		if !ok {
-			log.Println("[CONTROL] Key event missing 'key' field.")
-			return
-		}
-		robotgo.KeyTap(key_str)
 
 	default:
 		log.Printf("[CONTROL] Unhandled event type: %s", t)
@@ -880,11 +965,6 @@ func startVideoStats() {
 	}()
 }
 
-// ИСПРАВЛЕНО #6: прежняя реализация делила на div уже после его инкремента
-// в теле цикла, что давало результат ~0 для любого значения.
-// Например: n=1500 → div начинает с 1024, цикл: 1500>=1024 → div=1048576,
-// результат: 1500/1048576 ≈ 0.001 KB (неверно).
-// Исправлено: цикл итерирует по уменьшающемуся n, div накапливает множитель.
 func formatBytes(b int64) string {
 	const unit = 1024
 	if b < unit {
