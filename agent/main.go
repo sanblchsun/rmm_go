@@ -24,22 +24,49 @@ import (
 	"github.com/pion/webrtc/v3/pkg/media"
 )
 
-// === PHASE 1: SIMPLIFIED CONFIGURATION ===
 const (
 	serverURL           = "ws://192.168.2.222:8000/ws/agent/agent1"
 	websocketMaxRetries = 5
 	websocketRetryDelay = 5 * time.Second
 
-	// PHASE 1: Fixed resolution for stability
-	FIXED_WIDTH     = 1920
-	FIXED_HEIGHT    = 1080
-	FIXED_FRAMERATE = 30
+	// DEFAULT resolution - can be changed via quality commands
+	DEFAULT_WIDTH     = 1920
+	DEFAULT_HEIGHT    = 1080
+	DEFAULT_FRAMERATE = 30
 )
 
 func init() {
 	if runtime.GOOS == "windows" {
 		initWindowsDPI()
 	}
+}
+
+// === QUALITY CONFIGURATION ===
+type QualityConfig struct {
+	Width   int
+	Height  int
+	Bitrate string
+	Maxrate string
+	Bufsize string
+	FPS     int
+}
+
+var QUALITY_PRESETS = map[string]QualityConfig{
+	"720p": {
+		Width: 1280, Height: 720,
+		Bitrate: "2M", Maxrate: "3M", Bufsize: "4M",
+		FPS: 30,
+	},
+	"1080p": {
+		Width: 1920, Height: 1080,
+		Bitrate: "4M", Maxrate: "6M", Bufsize: "8M",
+		FPS: 30,
+	},
+	"1440p": {
+		Width: 2560, Height: 1440,
+		Bitrate: "8M", Maxrate: "12M", Bufsize: "16M",
+		FPS: 30,
+	},
 }
 
 // === GLOBAL VARIABLES ===
@@ -55,6 +82,10 @@ var (
 	ffmpegMutex         sync.Mutex
 	ffmpegStatsReset    = make(chan struct{}, 1)
 	currentFFmpegCmd    *exec.Cmd
+
+	// PHASE 2: Dynamic quality settings
+	currentQuality = "1080p"
+	qualityMutex   sync.RWMutex
 )
 
 // === CHANNEL MANAGER ===
@@ -70,6 +101,29 @@ func initWindowsDPI() {
 	setDPIAware.Call()
 }
 
+// === QUALITY MANAGEMENT ===
+func getCurrentQualityConfig() QualityConfig {
+	qualityMutex.RLock()
+	defer qualityMutex.RUnlock()
+
+	if config, exists := QUALITY_PRESETS[currentQuality]; exists {
+		return config
+	}
+	return QUALITY_PRESETS["1080p"] // fallback
+}
+
+func setCurrentQuality(quality string) {
+	qualityMutex.Lock()
+	defer qualityMutex.Unlock()
+
+	if _, exists := QUALITY_PRESETS[quality]; exists {
+		currentQuality = quality
+		log.Printf("[QUALITY] Changed to: %s", quality)
+	} else {
+		log.Printf("[QUALITY] Unknown quality: %s, keeping: %s", quality, currentQuality)
+	}
+}
+
 // === COMMUNICATION FUNCTIONS ===
 func sendControlMessage(data map[string]interface{}) error {
 	channelManager.mutex.RLock()
@@ -79,6 +133,9 @@ func sendControlMessage(data map[string]interface{}) error {
 	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
 		return fmt.Errorf("control channel not available")
 	}
+
+	// Add timestamp for latency measurement
+	data["timestamp"] = time.Now().UnixMilli()
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -108,18 +165,22 @@ func sendBinaryData(messageType string, payload []byte) error {
 	return dc.Send(message)
 }
 
-// === PHASE 1: SIMPLIFIED VIDEO INFO ===
+// === DYNAMIC VIDEO INFO ===
 func sendVideoInfo() {
+	config := getCurrentQualityConfig()
+
 	info := map[string]interface{}{
-		"type":   "video_info",
-		"width":  FIXED_WIDTH,
-		"height": FIXED_HEIGHT,
+		"type":    "video_info",
+		"width":   config.Width,
+		"height":  config.Height,
+		"quality": currentQuality,
+		"fps":     config.FPS,
 	}
 
 	if err := sendControlMessage(info); err != nil {
 		log.Printf("[ERROR] Failed to send video_info: %v", err)
 	} else {
-		log.Printf("[VIDEO] Sent video_info: %dx%d", FIXED_WIDTH, FIXED_HEIGHT)
+		log.Printf("[VIDEO] Sent video_info: %dx%d (%s)", config.Width, config.Height, currentQuality)
 	}
 }
 
@@ -170,8 +231,10 @@ func handleScreenshotRequest(payload []byte) {
 // === MAIN FUNCTION ===
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("🚀 RMM Agent v2.0 - Phase 1: Simplified Coordinates")
-	log.Printf("Fixed resolution: %dx%d", FIXED_WIDTH, FIXED_HEIGHT)
+	log.Printf("🚀 RMM Agent v2.0 - Phase 2: Fixed Quality Management")
+
+	config := getCurrentQualityConfig()
+	log.Printf("Initial quality: %s (%dx%d)", currentQuality, config.Width, config.Height)
 	log.Printf("Connecting to: %s", serverURL)
 
 	for i := 0; i < websocketMaxRetries; i++ {
@@ -219,7 +282,8 @@ func runAgent() error {
 		return fmt.Errorf("track create error: %w", err)
 	}
 
-	log.Printf("[FFMPEG] Starting with fixed resolution: %dx%d", FIXED_WIDTH, FIXED_HEIGHT)
+	config := getCurrentQualityConfig()
+	log.Printf("[FFMPEG] Starting with quality: %s (%dx%d)", currentQuality, config.Width, config.Height)
 	go manageFFmpegProcess(videoTrack)
 	startVideoStats()
 
@@ -239,6 +303,358 @@ func runAgent() error {
 		}
 		handleICE(msg, pcs, &pcsLock)
 	}
+}
+
+// === MESSAGE HANDLING ===
+func handleControlMessage(data []byte) {
+	var ctl map[string]interface{}
+	if err := json.Unmarshal(data, &ctl); err != nil {
+		log.Printf("[CONTROL] Invalid JSON: %v", err)
+		return
+	}
+
+	msgType, _ := ctl["type"].(string)
+	log.Printf("[CONTROL] Received: %s", msgType)
+
+	switch msgType {
+	case "request_video_info":
+		sendVideoInfo()
+
+	case "video_dimensions_confirmed":
+		width, _ := ctl["width"].(float64)
+		height, _ := ctl["height"].(float64)
+		log.Printf("[CONTROL] Browser confirmed dimensions: %.0fx%.0f", width, height)
+
+	// === PHASE 2: QUALITY CHANGE HANDLING ===
+	case "change_quality":
+		quality, ok := ctl["quality"].(string)
+		if !ok {
+			log.Printf("[CONTROL] Invalid quality change request")
+			return
+		}
+
+		log.Printf("[QUALITY] Received change request: %s", quality)
+
+		// Validate quality
+		if _, exists := QUALITY_PRESETS[quality]; !exists {
+			log.Printf("[QUALITY] Unknown quality preset: %s", quality)
+			return
+		}
+
+		// Update current quality
+		oldQuality := currentQuality
+		setCurrentQuality(quality)
+
+		if oldQuality != currentQuality {
+			log.Printf("[QUALITY] Quality changed: %s -> %s", oldQuality, currentQuality)
+
+			// Restart FFmpeg with new settings
+			select {
+			case ffmpegRestartSignal <- struct{}{}:
+				log.Printf("[QUALITY] FFmpeg restart signal sent")
+			default:
+				log.Printf("[QUALITY] FFmpeg restart signal already pending")
+			}
+
+			// Send confirmation
+			config := getCurrentQualityConfig()
+			confirmation := map[string]interface{}{
+				"type":    "quality_changed",
+				"quality": currentQuality,
+				"width":   config.Width,
+				"height":  config.Height,
+				"fps":     config.FPS,
+			}
+
+			if err := sendControlMessage(confirmation); err != nil {
+				log.Printf("[QUALITY] Failed to send confirmation: %v", err)
+			}
+
+			// Send updated video info
+			go func() {
+				time.Sleep(2 * time.Second) // Wait for FFmpeg to restart
+				sendVideoInfo()
+			}()
+		}
+
+	case "ping":
+		pong := map[string]interface{}{
+			"type": "pong",
+		}
+		if err := sendControlMessage(pong); err != nil {
+			log.Printf("[CONTROL] Failed to send pong: %v", err)
+		}
+
+	case "mouse_move":
+		x, okX := ctl["x"].(float64)
+		y, okY := ctl["y"].(float64)
+		if !okX || !okY {
+			log.Printf("[CONTROL] Invalid mouse_move coordinates")
+			return
+		}
+
+		// PHASE 2: Dynamic coordinate mapping based on current quality
+		config := getCurrentQualityConfig()
+		safeX := clampInt(int(x), 0, config.Width-1)
+		safeY := clampInt(int(y), 0, config.Height-1)
+		robotgo.MoveMouse(safeX, safeY)
+
+	case "mouse_down", "mouse_up":
+		btnF, ok := ctl["button"].(float64)
+		if !ok {
+			log.Printf("[CONTROL] Invalid mouse button")
+			return
+		}
+		btn := int(btnF)
+		names := []string{"left", "middle", "right"}
+		if btn < 0 || btn >= len(names) {
+			log.Printf("[CONTROL] Unknown mouse button: %d", btn)
+			return
+		}
+		if msgType == "mouse_down" {
+			robotgo.MouseDown(names[btn])
+		} else {
+			robotgo.MouseUp(names[btn])
+		}
+
+	case "key_down":
+		keyStr, ok := ctl["key"].(string)
+		if !ok {
+			log.Printf("[CONTROL] Missing key field")
+			return
+		}
+		robotgo.KeyDown(keyStr)
+
+	case "key_up":
+		keyStr, ok := ctl["key"].(string)
+		if !ok {
+			log.Printf("[CONTROL] Missing key field")
+			return
+		}
+		robotgo.KeyUp(keyStr)
+
+	default:
+		log.Printf("[CONTROL] Unhandled event: %s", msgType)
+	}
+}
+
+func handleBinaryMessage(data []byte) {
+	if len(data) < 4 {
+		log.Printf("[BINARY] Message too short: %d bytes", len(data))
+		return
+	}
+
+	msgType := string(data[:4])
+	payload := data[4:]
+
+	log.Printf("[BINARY] Received: '%s', %d bytes", msgType, len(payload))
+
+	switch strings.TrimSpace(msgType) {
+	case "SCRN":
+		handleScreenshotRequest(payload)
+	default:
+		log.Printf("[BINARY] Unknown message type: '%s'", msgType)
+	}
+}
+
+// === FFMPEG MANAGEMENT WITH DYNAMIC QUALITY ===
+func getFFmpegArgs() []string {
+	config := getCurrentQualityConfig()
+
+	var args []string
+	if runtime.GOOS == "windows" {
+		args = []string{"-f", "gdigrab", "-framerate", strconv.Itoa(config.FPS), "-draw_mouse", "1", "-i", "desktop"}
+	} else {
+		args = []string{"-f", "x11grab", "-framerate", strconv.Itoa(config.FPS), "-draw_mouse", "1", "-i", ":0.0"}
+	}
+
+	// PHASE 2: Dynamic resolution based on current quality
+	args = append(args, "-s", fmt.Sprintf("%dx%d", config.Width, config.Height))
+
+	args = append(args,
+		"-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+		"-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "30",
+		"-b:v", config.Bitrate, "-maxrate", config.Maxrate, "-bufsize", config.Bufsize,
+		"-fflags", "nobuffer", "-f", "h264", "-",
+	)
+
+	return args
+}
+
+func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
+	for {
+		config := getCurrentQualityConfig()
+		log.Printf("[FFMPEG] Starting new process with quality: %s (%dx%d)", currentQuality, config.Width, config.Height)
+
+		quitSignal := make(chan struct{})
+
+		ffmpegMutex.Lock()
+		if currentFFmpegCmd != nil && currentFFmpegCmd.Process != nil {
+			log.Println("[FFMPEG] Terminating previous process")
+			_ = currentFFmpegCmd.Process.Kill()
+		}
+		ffmpegMutex.Unlock()
+
+		args := getFFmpegArgs()
+		log.Printf("[FFMPEG] Command: ffmpeg %s", strings.Join(args, " "))
+
+		cmd := exec.Command("ffmpeg", args...)
+
+		ffmpegMutex.Lock()
+		currentFFmpegCmd = cmd
+		ffmpegMutex.Unlock()
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Printf("[FFMPEG] Stdout pipe error: %v", err)
+			time.Sleep(5 * time.Second)
+			close(quitSignal)
+			continue
+		}
+
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			log.Printf("[FFMPEG] Stderr pipe error: %v", err)
+			_ = stdout.Close()
+			time.Sleep(5 * time.Second)
+			close(quitSignal)
+			continue
+		}
+		go func() { io.Copy(io.Discard, stderr) }()
+
+		if err = cmd.Start(); err != nil {
+			log.Printf("[FFMPEG] Start error: %v", err)
+			_ = stdout.Close()
+			_ = stderr.Close()
+			time.Sleep(5 * time.Second)
+			close(quitSignal)
+			continue
+		}
+
+		log.Printf("[FFMPEG] Process started successfully with quality: %s", currentQuality)
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			streamVideo(stdout, videoTrack, quitSignal)
+		}()
+
+		ffmpegDone := make(chan struct{})
+		go func() {
+			defer close(ffmpegDone)
+			err := cmd.Wait()
+			if err != nil {
+				log.Printf("[FFMPEG] Process exited with error: %v", err)
+			} else {
+				log.Println("[FFMPEG] Process exited normally")
+			}
+			close(quitSignal)
+		}()
+
+		select {
+		case <-ffmpegRestartSignal:
+			log.Println("[FFMPEG] Restart signal received")
+			ffmpegMutex.Lock()
+			if cmd != nil && cmd.Process != nil {
+				if runtime.GOOS == "windows" {
+					_ = cmd.Process.Kill()
+				} else {
+					if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+						_ = cmd.Process.Kill()
+					}
+				}
+			}
+			ffmpegMutex.Unlock()
+			select {
+			case ffmpegStatsReset <- struct{}{}:
+			default:
+			}
+		case <-ffmpegDone:
+			log.Println("[FFMPEG] Process lifecycle completed")
+		}
+
+		wg.Wait()
+		<-ffmpegDone
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-chan struct{}) {
+	reader := bufio.NewReader(r)
+	const maxNALUBufferSize = 2 * 1024 * 1024
+	buf := make([]byte, 0, maxNALUBufferSize)
+	tmp := make([]byte, 4096)
+
+	config := getCurrentQualityConfig()
+
+	for {
+		select {
+		case <-quit:
+			log.Println("[FFMPEG] Video streaming stopped")
+			return
+		default:
+			n, err := reader.Read(tmp)
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					log.Printf("[FFMPEG] Read error: %v", err)
+				}
+				return
+			}
+
+			if len(buf)+n > maxNALUBufferSize {
+				log.Printf("[FFMPEG] Buffer overflow, resetting")
+				buf = buf[:0]
+				continue
+			}
+			buf = append(buf, tmp[:n]...)
+
+			for {
+				start := findStartCode(buf)
+				if start == -1 {
+					break
+				}
+
+				next := findStartCode(buf[start+4:])
+				if next == -1 {
+					break
+				}
+				next += start + 4
+
+				nalu := buf[start:next]
+				if len(nalu) == 0 {
+					buf = buf[next:]
+					continue
+				}
+
+				select {
+				case <-quit:
+					return
+				default:
+					_ = videoTrack.WriteSample(media.Sample{
+						Data:     nalu,
+						Duration: time.Second / time.Duration(config.FPS),
+					})
+
+					videoStatsLock.Lock()
+					videoBytesSent += int64(len(nalu))
+					videoFramesSent++
+					videoStatsLock.Unlock()
+				}
+				buf = buf[next:]
+			}
+		}
+	}
+}
+
+func findStartCode(data []byte) int {
+	for i := 0; i < len(data)-3; i++ {
+		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
+			return i
+		}
+	}
+	return -1
 }
 
 // === WebRTC SETUP ===
@@ -300,7 +716,7 @@ func newPeerConnection(out chan []byte, videoTrack *webrtc.TrackLocalStaticSampl
 func setupControlChannel(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
 		log.Println("[CONTROL] DataChannel opened")
-		sendVideoInfo() // Send fixed video dimensions
+		sendVideoInfo() // Send current video dimensions
 	})
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -338,302 +754,6 @@ func setupBinaryChannel(dc *webrtc.DataChannel) {
 	dc.OnError(func(err error) {
 		log.Printf("[BINARY] DataChannel error: %v", err)
 	})
-}
-
-// === MESSAGE HANDLING ===
-func handleControlMessage(data []byte) {
-	var ctl map[string]interface{}
-	if err := json.Unmarshal(data, &ctl); err != nil {
-		log.Printf("[CONTROL] Invalid JSON: %v", err)
-		return
-	}
-
-	msgType, _ := ctl["type"].(string)
-	log.Printf("[CONTROL] Received: %s", msgType)
-
-	switch msgType {
-	case "request_video_info":
-		sendVideoInfo()
-
-	case "video_dimensions_confirmed":
-		width, _ := ctl["width"].(float64)
-		height, _ := ctl["height"].(float64)
-		log.Printf("[CONTROL] Browser confirmed dimensions: %.0fx%.0f", width, height)
-
-	case "ping":
-		// Send pong response
-		pong := map[string]interface{}{
-			"type":      "pong",
-			"timestamp": time.Now().Unix(),
-		}
-		if err := sendControlMessage(pong); err != nil {
-			log.Printf("[CONTROL] Failed to send pong: %v", err)
-		}
-
-	case "mouse_move":
-		x, okX := ctl["x"].(float64)
-		y, okY := ctl["y"].(float64)
-		if !okX || !okY {
-			log.Printf("[CONTROL] Invalid mouse_move coordinates")
-			return
-		}
-
-		// PHASE 1: Direct 1:1 coordinate mapping
-		safeX := clampInt(int(x), 0, FIXED_WIDTH-1)
-		safeY := clampInt(int(y), 0, FIXED_HEIGHT-1)
-		robotgo.MoveMouse(safeX, safeY)
-
-	case "mouse_down", "mouse_up":
-		btnF, ok := ctl["button"].(float64)
-		if !ok {
-			log.Printf("[CONTROL] Invalid mouse button")
-			return
-		}
-		btn := int(btnF)
-		names := []string{"left", "middle", "right"}
-		if btn < 0 || btn >= len(names) {
-			log.Printf("[CONTROL] Unknown mouse button: %d", btn)
-			return
-		}
-		if msgType == "mouse_down" {
-			robotgo.MouseDown(names[btn])
-		} else {
-			robotgo.MouseUp(names[btn])
-		}
-
-	case "key_down":
-		keyStr, ok := ctl["key"].(string)
-		if !ok {
-			log.Printf("[CONTROL] Missing key field")
-			return
-		}
-		robotgo.KeyDown(keyStr)
-
-	case "key_up":
-		keyStr, ok := ctl["key"].(string)
-		if !ok {
-			log.Printf("[CONTROL] Missing key field")
-			return
-		}
-		robotgo.KeyUp(keyStr)
-
-	default:
-		log.Printf("[CONTROL] Unhandled event: %s", msgType)
-	}
-}
-
-func handleBinaryMessage(data []byte) {
-	if len(data) < 4 {
-		log.Printf("[BINARY] Message too short: %d bytes", len(data))
-		return
-	}
-
-	msgType := string(data[:4])
-	payload := data[4:]
-
-	log.Printf("[BINARY] Received: '%s', %d bytes", msgType, len(payload))
-
-	switch strings.TrimSpace(msgType) {
-	case "SCRN":
-		handleScreenshotRequest(payload)
-	default:
-		log.Printf("[BINARY] Unknown message type: '%s'", msgType)
-	}
-}
-
-// === FFMPEG MANAGEMENT ===
-func getFFmpegArgs() []string {
-	var args []string
-	if runtime.GOOS == "windows" {
-		args = []string{"-f", "gdigrab", "-framerate", strconv.Itoa(FIXED_FRAMERATE), "-draw_mouse", "1", "-i", "desktop"}
-	} else {
-		args = []string{"-f", "x11grab", "-framerate", strconv.Itoa(FIXED_FRAMERATE), "-draw_mouse", "1", "-i", ":0.0"}
-	}
-
-	// PHASE 1: Fixed resolution
-	args = append(args, "-s", fmt.Sprintf("%dx%d", FIXED_WIDTH, FIXED_HEIGHT))
-
-	args = append(args,
-		"-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-		"-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "30",
-		"-b:v", "4M", "-maxrate", "6M", "-bufsize", "8M",
-		"-fflags", "nobuffer", "-f", "h264", "-",
-	)
-
-	return args
-}
-
-func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
-	for {
-		log.Println("[FFMPEG] Starting new process...")
-
-		quitSignal := make(chan struct{})
-
-		ffmpegMutex.Lock()
-		if currentFFmpegCmd != nil && currentFFmpegCmd.Process != nil {
-			log.Println("[FFMPEG] Terminating previous process")
-			_ = currentFFmpegCmd.Process.Kill()
-		}
-		ffmpegMutex.Unlock()
-
-		args := getFFmpegArgs()
-		log.Printf("[FFMPEG] Command: ffmpeg %s", strings.Join(args, " "))
-
-		cmd := exec.Command("ffmpeg", args...)
-
-		ffmpegMutex.Lock()
-		currentFFmpegCmd = cmd
-		ffmpegMutex.Unlock()
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			log.Printf("[FFMPEG] Stdout pipe error: %v", err)
-			time.Sleep(5 * time.Second)
-			close(quitSignal)
-			continue
-		}
-
-		stderr, err := cmd.StderrPipe()
-		if err != nil {
-			log.Printf("[FFMPEG] Stderr pipe error: %v", err)
-			_ = stdout.Close()
-			time.Sleep(5 * time.Second)
-			close(quitSignal)
-			continue
-		}
-		go func() { io.Copy(io.Discard, stderr) }()
-
-		if err = cmd.Start(); err != nil {
-			log.Printf("[FFMPEG] Start error: %v", err)
-			_ = stdout.Close()
-			_ = stderr.Close()
-			time.Sleep(5 * time.Second)
-			close(quitSignal)
-			continue
-		}
-
-		log.Println("[FFMPEG] Process started successfully")
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-			streamVideo(stdout, videoTrack, quitSignal)
-		}()
-
-		ffmpegDone := make(chan struct{})
-		go func() {
-			defer close(ffmpegDone)
-			err := cmd.Wait()
-			if err != nil {
-				log.Printf("[FFMPEG] Process exited with error: %v", err)
-			} else {
-				log.Println("[FFMPEG] Process exited normally")
-			}
-			close(quitSignal)
-		}()
-
-		select {
-		case <-ffmpegRestartSignal:
-			log.Println("[FFMPEG] Restart signal received")
-			ffmpegMutex.Lock()
-			if cmd != nil && cmd.Process != nil {
-				if runtime.GOOS == "windows" {
-					_ = cmd.Process.Kill()
-				} else {
-					if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-						_ = cmd.Process.Kill()
-					}
-				}
-			}
-			ffmpegMutex.Unlock()
-			select {
-			case ffmpegStatsReset <- struct{}{}:
-			default:
-			}
-		case <-ffmpegDone:
-			log.Println("[FFMPEG] Process lifecycle completed")
-		}
-
-		wg.Wait()
-		<-ffmpegDone
-		time.Sleep(1 * time.Second)
-	}
-}
-
-func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-chan struct{}) {
-	reader := bufio.NewReader(r)
-	const maxNALUBufferSize = 2 * 1024 * 1024
-	buf := make([]byte, 0, maxNALUBufferSize)
-	tmp := make([]byte, 4096)
-
-	for {
-		select {
-		case <-quit:
-			log.Println("[FFMPEG] Video streaming stopped")
-			return
-		default:
-			n, err := reader.Read(tmp)
-			if err != nil {
-				if !errors.Is(err, io.EOF) {
-					log.Printf("[FFMPEG] Read error: %v", err)
-				}
-				return
-			}
-
-			if len(buf)+n > maxNALUBufferSize {
-				log.Printf("[FFMPEG] Buffer overflow, resetting")
-				buf = buf[:0]
-				continue
-			}
-			buf = append(buf, tmp[:n]...)
-
-			for {
-				start := findStartCode(buf)
-				if start == -1 {
-					break
-				}
-
-				next := findStartCode(buf[start+4:])
-				if next == -1 {
-					break
-				}
-				next += start + 4
-
-				nalu := buf[start:next]
-				if len(nalu) == 0 {
-					buf = buf[next:]
-					continue
-				}
-
-				select {
-				case <-quit:
-					return
-				default:
-					_ = videoTrack.WriteSample(media.Sample{
-						Data:     nalu,
-						Duration: time.Second / time.Duration(FIXED_FRAMERATE),
-					})
-
-					videoStatsLock.Lock()
-					videoBytesSent += int64(len(nalu))
-					videoFramesSent++
-					videoStatsLock.Unlock()
-				}
-				buf = buf[next:]
-			}
-		}
-	}
-}
-
-func findStartCode(data []byte) int {
-	for i := 0; i < len(data)-3; i++ {
-		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
-			return i
-		}
-	}
-	return -1
 }
 
 // === SDP/ICE HANDLING ===
@@ -727,8 +847,9 @@ func startVideoStats() {
 				fps := float64(framesDelta) / 5.0
 				mbps := float64(bytesDelta) * 8 / 1_000_000 / 5.0
 
-				log.Printf("[STATS] FPS: %.1f | Mbps: %.2f | Frames: %d | Total: %s",
-					fps, mbps, framesDelta, formatBytes(videoBytesSent))
+				config := getCurrentQualityConfig()
+				log.Printf("[STATS] Quality: %s | FPS: %.1f | Mbps: %.2f | Resolution: %dx%d | Frames: %d | Total: %s",
+					currentQuality, fps, mbps, config.Width, config.Height, framesDelta, formatBytes(videoBytesSent))
 			}
 		}
 	}()
