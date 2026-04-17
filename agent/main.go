@@ -28,11 +28,6 @@ const (
 	serverURL           = "ws://192.168.2.222:8000/ws/agent/agent1"
 	websocketMaxRetries = 5
 	websocketRetryDelay = 5 * time.Second
-
-	// DEFAULT resolution - can be changed via quality commands
-	DEFAULT_WIDTH     = 1920
-	DEFAULT_HEIGHT    = 1080
-	DEFAULT_FRAMERATE = 30
 )
 
 func init() {
@@ -41,31 +36,32 @@ func init() {
 	}
 }
 
-// === QUALITY CONFIGURATION ===
-type QualityConfig struct {
-	Width   int
-	Height  int
-	Bitrate string
-	Maxrate string
-	Bufsize string
-	FPS     int
+// === PHASE 3: ADAPTIVE RESOLUTION SYSTEM ===
+type ScreenInfo struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
 }
 
-var QUALITY_PRESETS = map[string]QualityConfig{
-	"720p": {
-		Width: 1280, Height: 720,
-		Bitrate: "2M", Maxrate: "3M", Bufsize: "4M",
-		FPS: 30,
+type QualitySettings struct {
+	Bitrate string `json:"bitrate"`
+	Maxrate string `json:"maxrate"`
+	Bufsize string `json:"bufsize"`
+	FPS     int    `json:"fps"`
+}
+
+// PHASE 3: Quality levels (bitrate only, resolution = native)
+var BITRATE_PRESETS = map[string]QualitySettings{
+	"low": {
+		Bitrate: "1M", Maxrate: "1.5M", Bufsize: "2M", FPS: 20,
 	},
-	"1080p": {
-		Width: 1920, Height: 1080,
-		Bitrate: "4M", Maxrate: "6M", Bufsize: "8M",
-		FPS: 30,
+	"medium": {
+		Bitrate: "3M", Maxrate: "4M", Bufsize: "6M", FPS: 25,
 	},
-	"1440p": {
-		Width: 2560, Height: 1440,
-		Bitrate: "8M", Maxrate: "12M", Bufsize: "16M",
-		FPS: 30,
+	"high": {
+		Bitrate: "6M", Maxrate: "8M", Bufsize: "12M", FPS: 30,
+	},
+	"ultra": {
+		Bitrate: "12M", Maxrate: "16M", Bufsize: "24M", FPS: 30,
 	},
 }
 
@@ -83,9 +79,11 @@ var (
 	ffmpegStatsReset    = make(chan struct{}, 1)
 	currentFFmpegCmd    *exec.Cmd
 
-	// PHASE 2: Dynamic quality settings
-	currentQuality = "1080p"
+	// PHASE 3: Native screen resolution and quality
+	nativeScreen   ScreenInfo
+	currentQuality = "medium"
 	qualityMutex   sync.RWMutex
+	screenDetected bool
 )
 
 // === CHANNEL MANAGER ===
@@ -101,22 +99,51 @@ func initWindowsDPI() {
 	setDPIAware.Call()
 }
 
+// === PHASE 3: NATIVE SCREEN DETECTION ===
+func detectNativeResolution() (ScreenInfo, error) {
+	width, height := robotgo.GetScreenSize()
+	if width <= 0 || height <= 0 {
+		return ScreenInfo{}, fmt.Errorf("invalid screen size: %dx%d", width, height)
+	}
+
+	screen := ScreenInfo{
+		Width:  width,
+		Height: height,
+	}
+
+	log.Printf("[SCREEN] Detected native resolution: %dx%d", width, height)
+	return screen, nil
+}
+
+func initializeNativeScreen() error {
+	screen, err := detectNativeResolution()
+	if err != nil {
+		return fmt.Errorf("failed to detect screen: %v", err)
+	}
+
+	nativeScreen = screen
+	screenDetected = true
+
+	log.Printf("[PHASE3] Native screen initialized: %dx%d", nativeScreen.Width, nativeScreen.Height)
+	return nil
+}
+
 // === QUALITY MANAGEMENT ===
-func getCurrentQualityConfig() QualityConfig {
+func getCurrentQuality() QualitySettings {
 	qualityMutex.RLock()
 	defer qualityMutex.RUnlock()
 
-	if config, exists := QUALITY_PRESETS[currentQuality]; exists {
-		return config
+	if quality, exists := BITRATE_PRESETS[currentQuality]; exists {
+		return quality
 	}
-	return QUALITY_PRESETS["1080p"] // fallback
+	return BITRATE_PRESETS["medium"] // fallback
 }
 
-func setCurrentQuality(quality string) {
+func setCurrentQualityLevel(quality string) {
 	qualityMutex.Lock()
 	defer qualityMutex.Unlock()
 
-	if _, exists := QUALITY_PRESETS[quality]; exists {
+	if _, exists := BITRATE_PRESETS[quality]; exists {
 		currentQuality = quality
 		log.Printf("[QUALITY] Changed to: %s", quality)
 	} else {
@@ -165,22 +192,30 @@ func sendBinaryData(messageType string, payload []byte) error {
 	return dc.Send(message)
 }
 
-// === DYNAMIC VIDEO INFO ===
-func sendVideoInfo() {
-	config := getCurrentQualityConfig()
+// === PHASE 3: NATIVE VIDEO INFO ===
+func sendNativeVideoInfo() {
+	if !screenDetected {
+		log.Printf("[VIDEO] Screen not detected yet, skipping video info")
+		return
+	}
+
+	quality := getCurrentQuality()
 
 	info := map[string]interface{}{
-		"type":    "video_info",
-		"width":   config.Width,
-		"height":  config.Height,
-		"quality": currentQuality,
-		"fps":     config.FPS,
+		"type":            "native_video_info",
+		"width":           nativeScreen.Width,
+		"height":          nativeScreen.Height,
+		"quality_level":   currentQuality,
+		"bitrate":         quality.Bitrate,
+		"fps":             quality.FPS,
+		"coordinate_mode": "native_1_to_1",
+		"phase":           "3_adaptive",
 	}
 
 	if err := sendControlMessage(info); err != nil {
-		log.Printf("[ERROR] Failed to send video_info: %v", err)
+		log.Printf("[ERROR] Failed to send native_video_info: %v", err)
 	} else {
-		log.Printf("[VIDEO] Sent video_info: %dx%d (%s)", config.Width, config.Height, currentQuality)
+		log.Printf("[VIDEO] Sent native video info: %dx%d (%s)", nativeScreen.Width, nativeScreen.Height, currentQuality)
 	}
 }
 
@@ -204,7 +239,7 @@ func captureScreenshot() ([]byte, error) {
 		return nil, fmt.Errorf("failed to encode PNG: %v", err)
 	}
 
-	log.Printf("[SCREENSHOT] Captured: %d bytes", buf.Len())
+	log.Printf("[SCREENSHOT] Captured: %d bytes (%dx%d)", buf.Len(), nativeScreen.Width, nativeScreen.Height)
 	return buf.Bytes(), nil
 }
 
@@ -231,10 +266,16 @@ func handleScreenshotRequest(payload []byte) {
 // === MAIN FUNCTION ===
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("🚀 RMM Agent v2.0 - Phase 2: Fixed Quality Management")
+	log.Printf("🚀 RMM Agent v3.0 - Phase 3: Adaptive Native Resolution")
 
-	config := getCurrentQualityConfig()
-	log.Printf("Initial quality: %s (%dx%d)", currentQuality, config.Width, config.Height)
+	// PHASE 3: Initialize native screen detection
+	if err := initializeNativeScreen(); err != nil {
+		log.Fatalf("Failed to initialize screen: %v", err)
+	}
+
+	// ИСПРАВЛЕНО: Удалена неиспользуемая переменная quality
+	log.Printf("Native resolution: %dx%d, Quality: %s",
+		nativeScreen.Width, nativeScreen.Height, currentQuality)
 	log.Printf("Connecting to: %s", serverURL)
 
 	for i := 0; i < websocketMaxRetries; i++ {
@@ -282,8 +323,8 @@ func runAgent() error {
 		return fmt.Errorf("track create error: %w", err)
 	}
 
-	config := getCurrentQualityConfig()
-	log.Printf("[FFMPEG] Starting with quality: %s (%dx%d)", currentQuality, config.Width, config.Height)
+	log.Printf("[FFMPEG] Starting native streaming: %dx%d (%s)",
+		nativeScreen.Width, nativeScreen.Height, currentQuality)
 	go manageFFmpegProcess(videoTrack)
 	startVideoStats()
 
@@ -317,53 +358,62 @@ func handleControlMessage(data []byte) {
 	log.Printf("[CONTROL] Received: %s", msgType)
 
 	switch msgType {
-	case "request_video_info":
-		sendVideoInfo()
+	case "request_native_video_info":
+		sendNativeVideoInfo()
 
-	case "video_dimensions_confirmed":
+	case "browser_video_confirmed":
 		width, _ := ctl["width"].(float64)
 		height, _ := ctl["height"].(float64)
-		log.Printf("[CONTROL] Browser confirmed dimensions: %.0fx%.0f", width, height)
+		log.Printf("[CONTROL] Browser confirmed video: %.0fx%.0f", width, height)
 
-	// === PHASE 2: QUALITY CHANGE HANDLING ===
+		// Verify browser received correct native resolution
+		if int(width) != nativeScreen.Width || int(height) != nativeScreen.Height {
+			log.Printf("[WARNING] Resolution mismatch! Native: %dx%d, Browser: %.0fx%.0f",
+				nativeScreen.Width, nativeScreen.Height, width, height)
+		} else {
+			log.Printf("[SUCCESS] Browser-Agent resolution synchronized: %dx%d", nativeScreen.Width, nativeScreen.Height)
+		}
+
+	// === PHASE 3: QUALITY CHANGE (BITRATE ONLY) ===
 	case "change_quality":
-		quality, ok := ctl["quality"].(string)
+		quality, ok := ctl["quality_level"].(string)
 		if !ok {
 			log.Printf("[CONTROL] Invalid quality change request")
 			return
 		}
 
-		log.Printf("[QUALITY] Received change request: %s", quality)
+		log.Printf("[QUALITY] Received bitrate change request: %s", quality)
 
-		// Validate quality
-		if _, exists := QUALITY_PRESETS[quality]; !exists {
-			log.Printf("[QUALITY] Unknown quality preset: %s", quality)
+		// Validate quality level
+		if _, exists := BITRATE_PRESETS[quality]; !exists {
+			log.Printf("[QUALITY] Unknown quality level: %s", quality)
 			return
 		}
 
 		// Update current quality
 		oldQuality := currentQuality
-		setCurrentQuality(quality)
+		setCurrentQualityLevel(quality)
 
 		if oldQuality != currentQuality {
-			log.Printf("[QUALITY] Quality changed: %s -> %s", oldQuality, currentQuality)
+			log.Printf("[QUALITY] Quality level changed: %s -> %s", oldQuality, currentQuality)
 
-			// Restart FFmpeg with new settings
+			// Restart FFmpeg with new bitrate settings
 			select {
 			case ffmpegRestartSignal <- struct{}{}:
-				log.Printf("[QUALITY] FFmpeg restart signal sent")
+				log.Printf("[QUALITY] FFmpeg restart signal sent for bitrate change")
 			default:
 				log.Printf("[QUALITY] FFmpeg restart signal already pending")
 			}
 
 			// Send confirmation
-			config := getCurrentQualityConfig()
+			newQuality := getCurrentQuality()
 			confirmation := map[string]interface{}{
-				"type":    "quality_changed",
-				"quality": currentQuality,
-				"width":   config.Width,
-				"height":  config.Height,
-				"fps":     config.FPS,
+				"type":          "quality_changed",
+				"quality_level": currentQuality,
+				"bitrate":       newQuality.Bitrate,
+				"fps":           newQuality.FPS,
+				"width":         nativeScreen.Width,
+				"height":        nativeScreen.Height,
 			}
 
 			if err := sendControlMessage(confirmation); err != nil {
@@ -373,7 +423,7 @@ func handleControlMessage(data []byte) {
 			// Send updated video info
 			go func() {
 				time.Sleep(2 * time.Second) // Wait for FFmpeg to restart
-				sendVideoInfo()
+				sendNativeVideoInfo()
 			}()
 		}
 
@@ -385,7 +435,14 @@ func handleControlMessage(data []byte) {
 			log.Printf("[CONTROL] Failed to send pong: %v", err)
 		}
 
+	// === PHASE 3: NATIVE 1:1 COORDINATE MAPPING ===
 	case "mouse_move":
+		// ИСПРАВЛЕНО: Проверка screenDetected перед использованием nativeScreen
+		if !screenDetected {
+			log.Printf("[CONTROL] Screen not detected, ignoring mouse_move")
+			return
+		}
+
 		x, okX := ctl["x"].(float64)
 		y, okY := ctl["y"].(float64)
 		if !okX || !okY {
@@ -393,10 +450,9 @@ func handleControlMessage(data []byte) {
 			return
 		}
 
-		// PHASE 2: Dynamic coordinate mapping based on current quality
-		config := getCurrentQualityConfig()
-		safeX := clampInt(int(x), 0, config.Width-1)
-		safeY := clampInt(int(y), 0, config.Height-1)
+		// PHASE 3: Direct 1:1 mapping (video coordinates = screen coordinates)
+		safeX := clampInt(int(x), 0, nativeScreen.Width-1)
+		safeY := clampInt(int(y), 0, nativeScreen.Height-1)
 		robotgo.MoveMouse(safeX, safeY)
 
 	case "mouse_down", "mouse_up":
@@ -457,24 +513,25 @@ func handleBinaryMessage(data []byte) {
 	}
 }
 
-// === FFMPEG MANAGEMENT WITH DYNAMIC QUALITY ===
-func getFFmpegArgs() []string {
-	config := getCurrentQualityConfig()
+// === PHASE 3: NATIVE FFMPEG CONFIGURATION ===
+func getNativeFFmpegArgs() []string {
+	quality := getCurrentQuality()
 
 	var args []string
 	if runtime.GOOS == "windows" {
-		args = []string{"-f", "gdigrab", "-framerate", strconv.Itoa(config.FPS), "-draw_mouse", "1", "-i", "desktop"}
+		args = []string{"-f", "gdigrab", "-framerate", strconv.Itoa(quality.FPS), "-draw_mouse", "1", "-i", "desktop"}
 	} else {
-		args = []string{"-f", "x11grab", "-framerate", strconv.Itoa(config.FPS), "-draw_mouse", "1", "-i", ":0.0"}
+		args = []string{"-f", "x11grab", "-framerate", strconv.Itoa(quality.FPS), "-draw_mouse", "1", "-i", ":0.0"}
 	}
 
-	// PHASE 2: Dynamic resolution based on current quality
-	args = append(args, "-s", fmt.Sprintf("%dx%d", config.Width, config.Height))
+	// PHASE 3: NO forced resolution - stream native screen size
+	// FFmpeg will automatically use the native desktop resolution
 
 	args = append(args,
 		"-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
 		"-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "30",
-		"-b:v", config.Bitrate, "-maxrate", config.Maxrate, "-bufsize", config.Bufsize,
+		// PHASE 3: Only bitrate settings change, resolution is native
+		"-b:v", quality.Bitrate, "-maxrate", quality.Maxrate, "-bufsize", quality.Bufsize,
 		"-fflags", "nobuffer", "-f", "h264", "-",
 	)
 
@@ -483,8 +540,9 @@ func getFFmpegArgs() []string {
 
 func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 	for {
-		config := getCurrentQualityConfig()
-		log.Printf("[FFMPEG] Starting new process with quality: %s (%dx%d)", currentQuality, config.Width, config.Height)
+		quality := getCurrentQuality()
+		log.Printf("[FFMPEG] Starting native process: %dx%d, quality: %s (bitrate: %s)",
+			nativeScreen.Width, nativeScreen.Height, currentQuality, quality.Bitrate)
 
 		quitSignal := make(chan struct{})
 
@@ -495,8 +553,8 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 		}
 		ffmpegMutex.Unlock()
 
-		args := getFFmpegArgs()
-		log.Printf("[FFMPEG] Command: ffmpeg %s", strings.Join(args, " "))
+		args := getNativeFFmpegArgs()
+		log.Printf("[FFMPEG] Native command: ffmpeg %s", strings.Join(args, " "))
 
 		cmd := exec.Command("ffmpeg", args...)
 
@@ -531,7 +589,7 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 			continue
 		}
 
-		log.Printf("[FFMPEG] Process started successfully with quality: %s", currentQuality)
+		log.Printf("[FFMPEG] Native process started: %dx%d @ %s", nativeScreen.Width, nativeScreen.Height, quality.Bitrate)
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -555,7 +613,7 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 
 		select {
 		case <-ffmpegRestartSignal:
-			log.Println("[FFMPEG] Restart signal received")
+			log.Println("[FFMPEG] Restart signal received for bitrate change")
 			ffmpegMutex.Lock()
 			if cmd != nil && cmd.Process != nil {
 				if runtime.GOOS == "windows" {
@@ -572,7 +630,7 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 			default:
 			}
 		case <-ffmpegDone:
-			log.Println("[FFMPEG] Process lifecycle completed")
+			log.Println("[FFMPEG] Native process lifecycle completed")
 		}
 
 		wg.Wait()
@@ -587,12 +645,11 @@ func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-
 	buf := make([]byte, 0, maxNALUBufferSize)
 	tmp := make([]byte, 4096)
 
-	config := getCurrentQualityConfig()
-
+	// ИСПРАВЛЕНО: Используем качество напрямую в коде, где это необходимо
 	for {
 		select {
 		case <-quit:
-			log.Println("[FFMPEG] Video streaming stopped")
+			log.Println("[FFMPEG] Native video streaming stopped")
 			return
 		default:
 			n, err := reader.Read(tmp)
@@ -632,9 +689,11 @@ func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-
 				case <-quit:
 					return
 				default:
+					// ИСПРАВЛЕНО: Получаем качество только когда используем
+					quality := getCurrentQuality()
 					_ = videoTrack.WriteSample(media.Sample{
 						Data:     nalu,
-						Duration: time.Second / time.Duration(config.FPS),
+						Duration: time.Second / time.Duration(quality.FPS),
 					})
 
 					videoStatsLock.Lock()
@@ -716,7 +775,7 @@ func newPeerConnection(out chan []byte, videoTrack *webrtc.TrackLocalStaticSampl
 func setupControlChannel(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
 		log.Println("[CONTROL] DataChannel opened")
-		sendVideoInfo() // Send current video dimensions
+		sendNativeVideoInfo() // Send native screen dimensions
 	})
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -779,14 +838,23 @@ func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnectio
 	pcs["viewer"] = pc
 	lock.Unlock()
 
-	_ = pc.SetRemoteDescription(sdp)
+	// ИСПРАВЛЕНО: Проверяем ошибки SetRemoteDescription и SetLocalDescription
+	if err := pc.SetRemoteDescription(sdp); err != nil {
+		log.Printf("[WebRTC] SetRemoteDescription error: %v", err)
+		return true
+	}
 
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		log.Printf("[WebRTC] CreateAnswer error: %v", err)
 		return true
 	}
-	_ = pc.SetLocalDescription(answer)
+
+	if err := pc.SetLocalDescription(answer); err != nil {
+		log.Printf("[WebRTC] SetLocalDescription error: %v", err)
+		return true
+	}
+
 	payload, _ := json.Marshal(answer)
 	out <- payload
 
@@ -835,7 +903,7 @@ func startVideoStats() {
 				prevBytes = videoBytesSent
 				prevFrames = videoFramesSent
 				videoStatsLock.Unlock()
-				log.Println("[STATS] Counters reset")
+				log.Println("[STATS] Counters reset for new quality")
 			case <-ticker.C:
 				videoStatsLock.Lock()
 				bytesDelta := videoBytesSent - prevBytes
@@ -847,9 +915,10 @@ func startVideoStats() {
 				fps := float64(framesDelta) / 5.0
 				mbps := float64(bytesDelta) * 8 / 1_000_000 / 5.0
 
-				config := getCurrentQualityConfig()
-				log.Printf("[STATS] Quality: %s | FPS: %.1f | Mbps: %.2f | Resolution: %dx%d | Frames: %d | Total: %s",
-					currentQuality, fps, mbps, config.Width, config.Height, framesDelta, formatBytes(videoBytesSent))
+				quality := getCurrentQuality()
+				log.Printf("[STATS] Native: %dx%d | Quality: %s | FPS: %.1f | Mbps: %.2f | Target: %s@%dfps | Frames: %d | Total: %s",
+					nativeScreen.Width, nativeScreen.Height, currentQuality, fps, mbps,
+					quality.Bitrate, quality.FPS, framesDelta, formatBytes(videoBytesSent))
 			}
 		}
 	}()
