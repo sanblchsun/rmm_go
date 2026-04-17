@@ -17,7 +17,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/go-vgo/robotgo"
 	"github.com/gorilla/websocket"
@@ -27,14 +26,14 @@ import (
 
 // === PHASE 1: SIMPLIFIED CONFIGURATION ===
 const (
-	serverURL              = "ws://192.168.88.127:8000/ws/agent/agent1"
-	websocketMaxRetries    = 5
-	websocketRetryDelay    = 5 * time.Second
-	
+	serverURL           = "ws://192.168.2.222:8000/ws/agent/agent1"
+	websocketMaxRetries = 5
+	websocketRetryDelay = 5 * time.Second
+
 	// PHASE 1: Fixed resolution for stability
-	FIXED_WIDTH           = 1920
-	FIXED_HEIGHT          = 1080
-	FIXED_FRAMERATE       = 30
+	FIXED_WIDTH     = 1920
+	FIXED_HEIGHT    = 1080
+	FIXED_FRAMERATE = 30
 )
 
 func init() {
@@ -45,8 +44,8 @@ func init() {
 
 // === GLOBAL VARIABLES ===
 var (
-	user32             = syscall.NewLazyDLL("user32.dll")
-	setDPIAware        = user32.NewProc("SetProcessDPIAware")
+	user32      = syscall.NewLazyDLL("user32.dll")
+	setDPIAware = user32.NewProc("SetProcessDPIAware")
 
 	videoBytesSent  int64
 	videoFramesSent int64
@@ -364,7 +363,7 @@ func handleControlMessage(data []byte) {
 	case "ping":
 		// Send pong response
 		pong := map[string]interface{}{
-			"type": "pong",
+			"type":      "pong",
 			"timestamp": time.Now().Unix(),
 		}
 		if err := sendControlMessage(pong); err != nil {
@@ -479,7 +478,7 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 
 		args := getFFmpegArgs()
 		log.Printf("[FFMPEG] Command: ffmpeg %s", strings.Join(args, " "))
-		
+
 		cmd := exec.Command("ffmpeg", args...)
 
 		ffmpegMutex.Lock()
