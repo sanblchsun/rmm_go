@@ -72,10 +72,13 @@ var (
 )
 
 // --- Channel Manager ---
+// Менеджер для управления ДВУМЯ DataChannel внутри WebRTC соединения:
+// 1. controlChannel - для JSON сообщений (команды, запросы)
+// 2. binaryChannel - для BLOB данных (скриншоты, файлы)
 type ChannelManager struct {
-	controlChannel *webrtc.DataChannel
-	binaryChannel  *webrtc.DataChannel
-	mutex          sync.RWMutex
+	controlChannel *webrtc.DataChannel // Канал для JSON сообщений
+	binaryChannel  *webrtc.DataChannel // Канал для BLOB данных
+	mutex          sync.RWMutex        // Мьютекс для безопасного доступа к каналам
 }
 
 var channelManager = &ChannelManager{}
@@ -145,6 +148,7 @@ func getPhysicalScreenSize() (int, int) {
 }
 
 // --- Channel Management Functions ---
+// ОТПРАВКА JSON СООБЩЕНИЙ через controlChannel (команды управления, информация)
 func sendControlMessage(data map[string]interface{}) error {
 	channelManager.mutex.RLock()
 	dc := channelManager.controlChannel
@@ -154,14 +158,17 @@ func sendControlMessage(data map[string]interface{}) error {
 		return fmt.Errorf("control channel not available")
 	}
 
+	// Кодируем данные в JSON
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("json marshal error: %v", err)
 	}
 
+	// Отправляем как текстовое сообщение через control DataChannel
 	return dc.SendText(string(jsonData))
 }
 
+// ОТПРАВКА BLOB ДАННЫХ через binaryChannel (скриншоты, файлы)
 func sendBinaryData(messageType string, payload []byte) error {
 	channelManager.mutex.RLock()
 	dc := channelManager.binaryChannel
@@ -171,6 +178,7 @@ func sendBinaryData(messageType string, payload []byte) error {
 		return fmt.Errorf("binary channel not available")
 	}
 
+	// Формируем бинарный пакет: 4 байта тип + данные полезной нагрузки
 	// Ensure message type is exactly 4 bytes
 	typeBytes := []byte(messageType)
 	if len(typeBytes) < 4 {
@@ -179,7 +187,9 @@ func sendBinaryData(messageType string, payload []byte) error {
 		typeBytes = typeBytes[:4]
 	}
 
+	// Объединяем тип и данные в один массив
 	message := append(typeBytes, payload...)
+	// Отправляем как бинарные данные через binary DataChannel
 	return dc.Send(message)
 }
 
@@ -189,12 +199,14 @@ func sendScreenInfo() {
 		w, h = detectResolution()
 	}
 
+	// Формируем JSON сообщение с информацией об экране
 	info := map[string]interface{}{
 		"type":   "screen_info",
 		"width":  w,
 		"height": h,
 	}
 
+	// Отправляем через controlChannel
 	if err := sendControlMessage(info); err != nil {
 		log.Printf("[ERROR] Failed to send screen_info: %v", err)
 	} else {
@@ -243,6 +255,7 @@ func sendWindowInfo() {
 		return
 	}
 
+	// Формируем JSON сообщение с информацией об активном окне
 	info := map[string]interface{}{
 		"type":   "window_info",
 		"title":  wi.Title,
@@ -252,6 +265,7 @@ func sendWindowInfo() {
 		"height": wi.Height,
 	}
 
+	// Отправляем через controlChannel
 	if err := sendControlMessage(info); err != nil {
 		log.Printf("[ERROR] Failed to send window_info: %v", err)
 	}
@@ -283,18 +297,21 @@ func detectResolution() (int, int) {
 // --- Screenshot Functions ---
 func captureScreenshot() ([]byte, error) {
 	log.Println("[SCREENSHOT] Starting screen capture...")
-	
+
+	// Захватываем экран с помощью robotgo
 	bitmap := robotgo.CaptureScreen()
 	if bitmap == nil {
 		return nil, fmt.Errorf("failed to capture screen")
 	}
 	defer robotgo.FreeBitmap(bitmap)
 
+	// Конвертируем в изображение
 	img := robotgo.ToImage(bitmap)
 	if img == nil {
 		return nil, fmt.Errorf("failed to convert bitmap to image")
 	}
 
+	// Кодируем в PNG формат
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		return nil, fmt.Errorf("failed to encode PNG: %v", err)
@@ -304,13 +321,15 @@ func captureScreenshot() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// ОБРАБОТКА ЗАПРОСА СКРИНШОТА полученного через binaryChannel
 func handleScreenshotRequest(payload []byte) {
 	log.Println("[BINARY] Processing screenshot request...")
-	
+
+	// Делаем скриншот
 	screenshot, err := captureScreenshot()
 	if err != nil {
 		log.Printf("[BINARY] Screenshot error: %v", err)
-		// Send error response
+		// Отправляем сообщение об ошибке через binaryChannel
 		errorMsg := fmt.Sprintf("ERROR: %v", err)
 		if err := sendBinaryData("SCRN", []byte(errorMsg)); err != nil {
 			log.Printf("[BINARY] Failed to send screenshot error: %v", err)
@@ -318,6 +337,7 @@ func handleScreenshotRequest(payload []byte) {
 		return
 	}
 
+	// Отправляем PNG данные скриншота через binaryChannel
 	if err := sendBinaryData("SCRN", screenshot); err != nil {
 		log.Printf("[BINARY] Failed to send screenshot: %v", err)
 	} else {
@@ -351,6 +371,7 @@ func main() {
 }
 
 func runAgent() error {
+	// Создаем WebSocket соединение для сигнализации WebRTC (НЕ для передачи данных!)
 	ws, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
 	if err != nil {
 		return fmt.Errorf("websocket connect error: %w", err)
@@ -358,6 +379,7 @@ func runAgent() error {
 	defer ws.Close()
 	log.Println("Connected to WebSocket server.")
 
+	// Канал для отправки сигнальных сообщений через WebSocket
 	writeChan := make(chan []byte, 100)
 	go func() {
 		for msg := range writeChan {
@@ -372,6 +394,7 @@ func runAgent() error {
 	pcs := make(map[string]*webrtc.PeerConnection)
 	var pcsLock sync.Mutex
 
+	// Создаем видеотрек для передачи видеопотока через WebRTC
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
 		"video", "rmm",
@@ -407,7 +430,7 @@ func runAgent() error {
 				log.Println("[FFmpeg] Restart signal already pending, skipping.")
 			}
 
-			// Send updated screen info
+			// Отправляем обновленную информацию об экране через controlChannel
 			info := map[string]interface{}{
 				"type":   "screen_info",
 				"width":  res[0],
@@ -421,6 +444,7 @@ func runAgent() error {
 		}
 	}()
 
+	// Главный цикл чтения сигнальных сообщений WebRTC через WebSocket
 	for {
 		_, msg, err := ws.ReadMessage()
 		if err != nil {
@@ -430,9 +454,11 @@ func runAgent() error {
 			}
 			return fmt.Errorf("websocket read error: %w", err)
 		}
+		// Обрабатываем SDP offer/answer
 		if handleSDP(msg, writeChan, pcs, &pcsLock, videoTrack) {
 			continue
 		}
+		// Обрабатываем ICE candidates
 		handleICE(msg, pcs, &pcsLock)
 	}
 }
@@ -446,21 +472,26 @@ func newPeerConnection(out chan []byte, videoTrack *webrtc.TrackLocalStaticSampl
 		return nil, err
 	}
 
+	// Добавляем видеотрек к WebRTC соединению
 	if _, err := pc.AddTrack(videoTrack); err != nil {
 		log.Printf("AddTrack error: %v", err)
 	}
 
+	// ОБРАБОТКА ВХОДЯЩИХ DataChannel от браузера
+	// Браузер создает два канала: "control" и "binary"
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		channelManager.mutex.Lock()
 		defer channelManager.mutex.Unlock()
 
 		switch dc.Label() {
 		case "control":
+			// СОЗДАНИЕ controlChannel для JSON сообщений
 			channelManager.controlChannel = dc
 			setupControlChannel(dc)
 			log.Println("[DATACHANNEL] Control channel established")
 
 		case "binary":
+			// СОЗДАНИЕ binaryChannel для BLOB данных
 			channelManager.binaryChannel = dc
 			setupBinaryChannel(dc)
 			log.Println("[DATACHANNEL] Binary channel established")
@@ -472,6 +503,7 @@ func newPeerConnection(out chan []byte, videoTrack *webrtc.TrackLocalStaticSampl
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
+			// Отправляем ICE candidates через WebSocket для сигнализации
 			if payload, err := json.Marshal(c.ToJSON()); err == nil {
 				out <- payload
 			}
@@ -482,6 +514,7 @@ func newPeerConnection(out chan []byte, videoTrack *webrtc.TrackLocalStaticSampl
 		log.Printf("Peer Connection State has changed to %s\n", s.String())
 		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
 			log.Printf("PeerConnection %s, detaching channels.", s.String())
+			// Отключаем каналы при закрытии соединения
 			channelManager.mutex.Lock()
 			channelManager.controlChannel = nil
 			channelManager.binaryChannel = nil
@@ -492,12 +525,15 @@ func newPeerConnection(out chan []byte, videoTrack *webrtc.TrackLocalStaticSampl
 	return pc, nil
 }
 
+// НАСТРОЙКА controlChannel для обработки JSON сообщений
 func setupControlChannel(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
 		log.Println("[CONTROL] DataChannel opened")
+		// Сразу отправляем информацию об экране при открытии канала
 		sendScreenInfo()
 	})
 
+	// ПОЛУЧЕНИЕ JSON СООБЩЕНИЙ от браузера через controlChannel
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		handleControlMessage(msg.Data)
 	})
@@ -514,11 +550,13 @@ func setupControlChannel(dc *webrtc.DataChannel) {
 	})
 }
 
+// НАСТРОЙКА binaryChannel для обработки BLOB данных
 func setupBinaryChannel(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
 		log.Println("[BINARY] DataChannel opened")
 	})
 
+	// ПОЛУЧЕНИЕ BLOB ДАННЫХ от браузера через binaryChannel
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		handleBinaryMessage(msg.Data)
 	})
@@ -535,12 +573,14 @@ func setupBinaryChannel(dc *webrtc.DataChannel) {
 	})
 }
 
+// ОБРАБОТКА BLOB СООБЩЕНИЙ полученных через binaryChannel
 func handleBinaryMessage(data []byte) {
 	if len(data) < 4 {
 		log.Printf("[BINARY] Message too short: %d bytes", len(data))
 		return
 	}
 
+	// Извлекаем тип сообщения из первых 4 байт
 	msgType := string(data[:4])
 	payload := data[4:]
 
@@ -548,8 +588,10 @@ func handleBinaryMessage(data []byte) {
 
 	switch strings.TrimSpace(msgType) {
 	case "SCRN":
+		// Запрос на создание скриншота
 		handleScreenshotRequest(payload)
 	case "FILE":
+		// Передача файла
 		handleFileTransfer(payload)
 	default:
 		log.Printf("[BINARY] Unknown message type: '%s'", msgType)
@@ -560,6 +602,7 @@ func handleBinaryMessage(data []byte) {
 func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnection,
 	lock *sync.Mutex, videoTrack *webrtc.TrackLocalStaticSample) bool {
 
+	// Обработка SDP offer от браузера
 	var sdp webrtc.SessionDescription
 	if err := json.Unmarshal(msg, &sdp); err != nil || sdp.Type != webrtc.SDPTypeOffer {
 		return false
@@ -581,6 +624,7 @@ func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnectio
 
 	_ = pc.SetRemoteDescription(sdp)
 
+	// Создаем и отправляем SDP answer через WebSocket
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		log.Printf("CreateAnswer error: %v", err)
@@ -594,6 +638,7 @@ func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnectio
 }
 
 func handleICE(msg []byte, pcs map[string]*webrtc.PeerConnection, lock *sync.Mutex) {
+	// Обработка ICE candidates
 	var ice webrtc.ICECandidateInit
 	if err := json.Unmarshal(msg, &ice); err != nil || ice.Candidate == "" {
 		return
@@ -688,6 +733,7 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 
 		go func() {
 			defer wg.Done()
+			// Передача H264 видеопотока через WebRTC видеотрек (отдельно от DataChannels)
 			streamVideo(stdout, videoTrack, quitSignal)
 		}()
 
@@ -758,6 +804,7 @@ func startScreenWatcher() {
 					log.Println("[SCREEN] Restart signal already pending from screen watcher, skipping.")
 				}
 
+				// Отправляем обновленную информацию об экране через controlChannel
 				info := map[string]interface{}{
 					"type":   "screen_info",
 					"width":  w,
@@ -773,6 +820,8 @@ func startScreenWatcher() {
 	}()
 }
 
+// Передача H264 видеопотока через WebRTC видеотрек
+// Это отдельный канал от DataChannels, используется только для видео
 func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-chan struct{}) {
 	reader := bufio.NewReader(r)
 	const maxNALUBufferSize = 2 * 1024 * 1024
@@ -823,6 +872,7 @@ func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-
 					log.Println("[FFmpeg Video Stream] Quit signal received during NALU processing, stopping.")
 					return
 				default:
+					// Отправляем H264 NALU через видеотрек WebRTC
 					_ = videoTrack.WriteSample(media.Sample{Data: nalu, Duration: time.Second / 30})
 
 					videoStatsLock.Lock()
@@ -846,6 +896,7 @@ func findStartCode(data []byte) int {
 }
 
 // --- Input Control ---
+// ОБРАБОТКА JSON КОМАНД полученных от браузера через controlChannel
 func handleControlMessage(data []byte) {
 	var ctl map[string]interface{}
 	if err := json.Unmarshal(data, &ctl); err != nil {
@@ -857,12 +908,15 @@ func handleControlMessage(data []byte) {
 
 	switch t {
 	case "request_screen_info":
+		// Браузер запросил информацию об экране
 		sendScreenInfo()
 
 	case "request_window_info":
+		// Браузер запросил информацию об активном окне
 		sendWindowInfo()
 
 	case "mouse_move":
+		// Команда перемещения мыши от браузера
 		x, okX := ctl["x"].(float64)
 		y, okY := ctl["y"].(float64)
 		if !okX || !okY {
@@ -884,6 +938,7 @@ func handleControlMessage(data []byte) {
 		robotgo.MoveMouse(safeX, safeY)
 
 	case "mouse_down", "mouse_up":
+		// Команды нажатия/отпускания кнопок мыши от браузера
 		btnF, ok := ctl["button"].(float64)
 		if !ok {
 			log.Println("[CONTROL] invalid button")
@@ -902,6 +957,7 @@ func handleControlMessage(data []byte) {
 		}
 
 	case "key_down":
+		// Команда нажатия клавиши от браузера
 		key_str, ok := ctl["key"].(string)
 		if !ok {
 			log.Println("[CONTROL] Key event missing 'key' field.")
@@ -910,6 +966,7 @@ func handleControlMessage(data []byte) {
 		robotgo.KeyDown(key_str)
 
 	case "key_up":
+		// Команда отпускания клавиши от браузера
 		key_str, ok := ctl["key"].(string)
 		if !ok {
 			log.Println("[CONTROL] Key event missing 'key' field.")

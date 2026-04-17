@@ -147,8 +147,14 @@
     </div>
 
     <script>
+      // WebRTC PeerConnection и WebSocket для сигнализации
       let pc, ws;
+
+      // ДВА РАЗНЫХ DataChannel внутри WebRTC соединения:
+      // 1. controlChannel - для передачи JSON сообщений (команды мыши/клавиатуры, запросы информации)
+      // 2. binaryChannel - для передачи BLOB данных (скриншоты, файлы)
       let controlChannel, binaryChannel;
+
       let remoteScreenWidth = 0;
       let remoteScreenHeight = 0;
       let currentWindow = { x: 0, y: 0, width: 0, height: 0, title: "" };
@@ -233,10 +239,13 @@
         layoutIndicator.textContent = currentLayout === "ru" ? "RU" : "EN";
       }
 
+      // ОТПРАВКА JSON СООБЩЕНИЙ через controlChannel (DataChannel внутри WebRTC)
+      // Используется для: команд мыши/клавиатуры, запросов информации экрана/окон
       function sendControl(type, payload = {}) {
         if (controlChannel && controlChannel.readyState === "open") {
           try {
             const message = { type, ...payload };
+            // JSON сообщение отправляется как ТЕКСТ через control DataChannel
             controlChannel.send(JSON.stringify(message));
           } catch (e) {
             console.error("Failed to send control message:", e);
@@ -244,15 +253,19 @@
         }
       }
 
+      // ОТПРАВКА BLOB ДАННЫХ через binaryChannel (DataChannel внутри WebRTC)
+      // Используется для: запросов скриншотов, передачи файлов
       function sendBinary(messageType, payload = new Uint8Array()) {
         if (binaryChannel && binaryChannel.readyState === "open") {
           try {
+            // Формируем бинарный пакет: 4 байта тип + данные
             const typeBytes = new TextEncoder().encode(
               messageType.padEnd(4).slice(0, 4),
             );
             const message = new Uint8Array(typeBytes.length + payload.length);
             message.set(typeBytes, 0);
             message.set(payload, typeBytes.length);
+            // Бинарное сообщение отправляется как ArrayBuffer через binary DataChannel
             binaryChannel.send(message);
           } catch (e) {
             console.error("Failed to send binary message:", e);
@@ -360,6 +373,7 @@
 
       // --- WebSocket and WebRTC Connection ---
       async function connect() {
+        // Создаем WebSocket соединение для сигнализации WebRTC (НЕ для передачи данных!)
         const addr =
           "ws://" + window.location.hostname + ":8000/ws/viewer/agent1";
         ws = new WebSocket(addr);
@@ -370,19 +384,24 @@
 
           if (pc) pc.close();
 
+          // Создаем WebRTC соединение
           pc = new RTCPeerConnection({
             iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
           });
 
-          // Create both DataChannels
+          // СОЗДАНИЕ ДВУХ DataChannel внутри WebRTC соединения:
+          // 1. "control" - для JSON сообщений (ordered=true для надежности)
           controlChannel = pc.createDataChannel("control", { ordered: true });
+          // 2. "binary" - для BLOB данных (ordered=true для корректной передачи файлов)
           binaryChannel = pc.createDataChannel("binary", { ordered: true });
 
+          // Настраиваем обработчики для каждого канала
           setupControlChannel(controlChannel);
           setupBinaryChannel(binaryChannel);
           setupPeerConnection(pc);
 
           try {
+            // Создаем SDP offer и отправляем через WebSocket для сигнализации
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             ws.send(JSON.stringify(offer));
@@ -396,6 +415,7 @@
 
         ws.onmessage = async (e) => {
           try {
+            // Получаем сигнальные сообщения (SDP answer, ICE candidates)
             const data = JSON.parse(e.data);
             if (data.type === "answer") {
               await pc.setRemoteDescription(data);
@@ -424,15 +444,18 @@
         };
       }
 
+      // НАСТРОЙКА controlChannel - для передачи JSON команд и получения ответов
       function setupControlChannel(channel) {
         channel.onopen = () => {
           setStatus("Control Ready");
           setChannelStatus("control", "Connected", "#0f0");
           screenshotBtn.disabled = false;
           console.log("Control DataChannel opened");
+          // Сразу запрашиваем информацию об экране через JSON сообщение
           sendControl("request_screen_info");
         };
 
+        // ПОЛУЧЕНИЕ JSON СООБЩЕНИЙ от Go-агента через controlChannel
         channel.onmessage = (e) => {
           try {
             const data = JSON.parse(e.data);
@@ -454,7 +477,9 @@
         };
       }
 
+      // НАСТРОЙКА binaryChannel - для передачи BLOB данных (скриншоты, файлы)
       function setupBinaryChannel(channel) {
+        // Устанавливаем тип данных как ArrayBuffer для бинарных данных
         channel.binaryType = "arraybuffer";
 
         channel.onopen = () => {
@@ -462,6 +487,7 @@
           console.log("Binary DataChannel opened");
         };
 
+        // ПОЛУЧЕНИЕ BLOB ДАННЫХ от Go-агента через binaryChannel
         channel.onmessage = (e) => {
           handleBinaryMessage(e.data);
         };
@@ -478,6 +504,7 @@
       }
 
       function setupPeerConnection(pcInstance) {
+        // Получение видеопотока через WebRTC (отдельно от DataChannels)
         pcInstance.ontrack = (e) => {
           if (video.srcObject !== e.streams[0]) {
             video.srcObject = e.streams[0];
@@ -488,6 +515,7 @@
 
         pcInstance.onicecandidate = (e) => {
           if (e.candidate) {
+            // Отправляем ICE candidates через WebSocket для сигнализации
             ws.send(JSON.stringify(e.candidate));
           }
         };
@@ -509,12 +537,15 @@
           }
         };
 
+        // Настраиваем прием только видео (без аудио)
         pcInstance.addTransceiver("video", { direction: "recvonly" });
       }
 
+      // ОБРАБОТКА JSON СООБЩЕНИЙ полученных через controlChannel
       function handleControlMessage(data) {
         switch (data.type) {
           case "screen_info":
+            // Получили информацию о размерах экрана от Go-агента
             remoteScreenWidth = data.width;
             remoteScreenHeight = data.height;
             console.log(
@@ -527,6 +558,7 @@
             break;
 
           case "window_info":
+            // Получили информацию о текущем окне от Go-агента
             windowInfoRequestPending = false;
             currentWindow = {
               x: data.x,
@@ -547,6 +579,7 @@
         }
       }
 
+      // ОБРАБОТКА BLOB ДАННЫХ полученных через binaryChannel
       function handleBinaryMessage(arrayBuffer) {
         const data = new Uint8Array(arrayBuffer);
         if (data.length < 4) {
@@ -554,14 +587,17 @@
           return;
         }
 
+        // Извлекаем тип сообщения из первых 4 байт
         const msgType = String.fromCharCode(...data.slice(0, 4));
         const payload = data.slice(4);
 
         switch (msgType) {
           case "SCRN":
+            // Получили данные скриншота в виде PNG
             handleScreenshotData(payload);
             break;
           case "FILE":
+            // Получили данные файла
             handleFileData(payload);
             break;
           default:
@@ -569,15 +605,18 @@
         }
       }
 
+      // ОБРАБОТКА BLOB ДАННЫХ СКРИНШОТА
       function handleScreenshotData(data) {
         screenshotCounter++;
         console.log(
           `Received screenshot #${screenshotCounter}, size: ${data.length} bytes`,
         );
 
+        // Создаем Blob из полученных PNG данных
         const blob = new Blob([data], { type: "image/png" });
         const url = URL.createObjectURL(blob);
 
+        // Отображаем скриншот в модальном окне
         screenshotImg.src = url;
         screenshotModal.style.display = "flex";
 
@@ -721,12 +760,14 @@
 
         const mapped = mapPointerToRemote(e.clientX, e.clientY);
         if (mapped) {
+          // Отправляем команду перемещения мыши через controlChannel (JSON)
           sendControl("mouse_move", mapped);
         }
       });
 
       ["mousedown", "mouseup"].forEach((evt) =>
         video.addEventListener(evt, (e) => {
+          // Отправляем команды кликов мыши через controlChannel (JSON)
           sendControl(evt === "mousedown" ? "mouse_down" : "mouse_up", {
             button: e.button,
           });
@@ -757,6 +798,7 @@
           if (/[а-яёА-ЯЁ]/.test(latKey)) {
             latKey = cyrillicToLatinMap[latKey.toLowerCase()] || latKey;
           }
+          // Отправляем команду нажатия клавиши через controlChannel (JSON)
           sendControl("key_down", { key: latKey });
           e.preventDefault();
           return;
@@ -765,6 +807,7 @@
         const robotKey = mapKeyEventToRobotKey(e);
         if (robotKey) {
           e.preventDefault();
+          // Отправляем команду нажатия клавиши через controlChannel (JSON)
           sendControl("key_down", { key: robotKey });
         } else {
           e.preventDefault();
@@ -780,6 +823,7 @@
           /[а-яёА-ЯЁ]/.test(e.key)
         ) {
           const latKey = cyrillicToLatinMap[e.key.toLowerCase()] || e.key;
+          // Отправляем команду отпускания клавиши через controlChannel (JSON)
           sendControl("key_up", { key: latKey });
           e.preventDefault();
           return;
@@ -788,6 +832,7 @@
         const robotKey = mapKeyEventToRobotKey(e);
         if (robotKey) {
           e.preventDefault();
+          // Отправляем команду отпускания клавиши через controlChannel (JSON)
           sendControl("key_up", { key: robotKey });
         } else {
           e.preventDefault();
@@ -811,6 +856,7 @@
         }
 
         console.log("Requesting screenshot...");
+        // Отправляем запрос на скриншот через binaryChannel (BLOB данные)
         sendBinary("SCRN", new TextEncoder().encode("REQUEST"));
       }
 
@@ -859,6 +905,7 @@
           !windowInfoRequestPending
         ) {
           windowInfoRequestPending = true;
+          // Запрашиваем информацию об активном окне через controlChannel (JSON)
           sendControl("request_window_info");
         }
       }, WINDOW_INFO_INTERVAL);
