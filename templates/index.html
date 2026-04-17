@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>RMM Viewer - Dual Channel</title>
+    <title>RMM Viewer v2.0 - Phase 1 Fixed</title>
     <style>
       html,
       body {
@@ -120,6 +120,31 @@
         cursor: pointer;
         font-size: 12px;
       }
+
+      .debug-info {
+        position: fixed;
+        right: 10px;
+        top: 60px;
+        color: #0f0;
+        font-family: monospace;
+        font-size: 8px;
+        background: rgba(0, 0, 0, 0.8);
+        padding: 8px;
+        border-radius: 3px;
+        z-index: 1000;
+        max-width: 300px;
+        border: 1px solid #333;
+      }
+
+      .version-info {
+        position: fixed;
+        left: 10px;
+        top: 80px;
+        color: #666;
+        font-family: monospace;
+        font-size: 8px;
+        z-index: 1000;
+      }
     </style>
   </head>
 
@@ -135,9 +160,29 @@
       <div>Video: <span id="videoStatus">Waiting</span></div>
     </div>
 
+    <div class="version-info">
+      RMM v2.0 - Phase 1 Fixed<br />
+      Object-fit Aware
+    </div>
+
     <div class="controls">
       <button id="screenshotBtn" class="btn" disabled>Screenshot (F9)</button>
-      <button id="statsBtn" class="btn">Stats</button>
+      <button id="debugBtn" class="btn">Debug</button>
+    </div>
+
+    <!-- Debug Info -->
+    <div id="debugInfo" class="debug-info" style="display: none">
+      <div><strong>PHASE 1 DEBUG - FIXED</strong></div>
+      <hr style="margin: 3px 0; border-color: #333" />
+      <div>Video Native: <span id="debugVideoSize">-</span></div>
+      <div>Element Size: <span id="debugElementSize">-</span></div>
+      <div>Draw Area: <span id="debugDrawArea">-</span></div>
+      <div>Offset: <span id="debugOffset">-</span></div>
+      <div>Mouse Local: <span id="debugMouseCoords">-</span></div>
+      <div>Mouse in Draw: <span id="debugMouseInDraw">-</span></div>
+      <div>Mouse Remote: <span id="debugRemoteCoords">-</span></div>
+      <div>Scale Factor: <span id="debugScaleFactor">-</span></div>
+      <div>Last Update: <span id="debugLastUpdate">-</span></div>
     </div>
 
     <!-- Screenshot Modal -->
@@ -147,25 +192,25 @@
     </div>
 
     <script>
-      // WebRTC PeerConnection и WebSocket для сигнализации
-      let pc, ws;
+      // === RMM VIEWER v2.0 - PHASE 1: FIXED COORDINATE SYSTEM ===
+      console.log(
+        "🚀 RMM Viewer v2.0 - Phase 1: Fixed Coordinates with object-fit support",
+      );
 
-      // ДВА РАЗНЫХ DataChannel внутри WebRTC соединения:
-      // 1. controlChannel - для передачи JSON сообщений (команды мыши/клавиатуры, запросы информации)
-      // 2. binaryChannel - для передачи BLOB данных (скриншоты, файлы)
+      // WebRTC и WebSocket variables
+      let pc, ws;
       let controlChannel, binaryChannel;
 
-      let remoteScreenWidth = 0;
-      let remoteScreenHeight = 0;
-      let currentWindow = { x: 0, y: 0, width: 0, height: 0, title: "" };
+      // PHASE 1: Single source of truth для coordinates
+      let videoNativeWidth = 0; // video.videoWidth - ЕДИНСТВЕННЫЙ источник ширины
+      let videoNativeHeight = 0; // video.videoHeight - ЕДИНСТВЕННЫЙ источник высоты
+
       let lastMouseMove = 0;
-      let windowInfoRequestPending = false;
-      const WINDOW_INFO_INTERVAL = 200;
-      const mouseMoveThrottle = 16; // ms, ~60fps
-      let currentLayout = "en"; // 'en' или 'ru'
+      const mouseMoveThrottle = 16; // ~60fps
+      let currentLayout = "en";
       let screenshotCounter = 0;
 
-      // Status Elements
+      // DOM elements
       const statusEl = document.getElementById("status");
       const controlStatusEl = document.getElementById("controlStatus");
       const binaryStatusEl = document.getElementById("binaryStatus");
@@ -176,7 +221,19 @@
       const screenshotModal = document.getElementById("screenshotModal");
       const screenshotImg = document.getElementById("screenshotImg");
 
-      // Кириллица -> латинские клавиши (для русской раскладки)
+      // Debug elements
+      const debugInfo = document.getElementById("debugInfo");
+      const debugVideoSize = document.getElementById("debugVideoSize");
+      const debugElementSize = document.getElementById("debugElementSize");
+      const debugDrawArea = document.getElementById("debugDrawArea");
+      const debugOffset = document.getElementById("debugOffset");
+      const debugMouseCoords = document.getElementById("debugMouseCoords");
+      const debugMouseInDraw = document.getElementById("debugMouseInDraw");
+      const debugRemoteCoords = document.getElementById("debugRemoteCoords");
+      const debugScaleFactor = document.getElementById("debugScaleFactor");
+      const debugLastUpdate = document.getElementById("debugLastUpdate");
+
+      // Cyrillic to Latin mapping for Russian layout
       const cyrillicToLatinMap = {
         й: "q",
         ц: "w",
@@ -215,13 +272,14 @@
         Ё: "~",
       };
 
-      // Блокируем контекстное меню
+      // Prevent context menu
       document.addEventListener("contextmenu", (e) => e.preventDefault());
 
-      // --- Helper Functions ---
+      // === HELPER FUNCTIONS ===
       function setStatus(msg, color = "#0f0") {
         statusEl.textContent = msg;
         statusEl.style.color = color;
+        console.log(`[STATUS] ${msg}`);
       }
 
       function setChannelStatus(channel, status, color = "#0f0") {
@@ -239,51 +297,253 @@
         layoutIndicator.textContent = currentLayout === "ru" ? "RU" : "EN";
       }
 
-      // ОТПРАВКА JSON СООБЩЕНИЙ через controlChannel (DataChannel внутри WebRTC)
-      // Используется для: команд мыши/клавиатуры, запросов информации экрана/окон
+      function updateDebugInfo(coords = {}) {
+        if (debugInfo.style.display === "block") {
+          const rect = video.getBoundingClientRect();
+
+          debugVideoSize.textContent = `${videoNativeWidth}x${videoNativeHeight}`;
+          debugElementSize.textContent = `${Math.round(rect.width)}x${Math.round(rect.height)}`;
+
+          if (coords.drawWidth && coords.drawHeight) {
+            debugDrawArea.textContent = `${Math.round(coords.drawWidth)}x${Math.round(coords.drawHeight)}`;
+          }
+
+          if (coords.offsetX !== undefined && coords.offsetY !== undefined) {
+            debugOffset.textContent = `${Math.round(coords.offsetX)},${Math.round(coords.offsetY)}`;
+          }
+
+          if (coords.mouseX !== undefined && coords.mouseY !== undefined) {
+            debugMouseCoords.textContent = `${Math.round(coords.mouseX)},${Math.round(coords.mouseY)}`;
+          }
+
+          if (coords.xInVideo !== undefined && coords.yInVideo !== undefined) {
+            debugMouseInDraw.textContent = `${Math.round(coords.xInVideo)},${Math.round(coords.yInVideo)}`;
+          }
+
+          if (coords.remoteX !== undefined && coords.remoteY !== undefined) {
+            debugRemoteCoords.textContent = `${coords.remoteX},${coords.remoteY}`;
+          }
+
+          if (videoNativeWidth && rect.width && coords.drawWidth) {
+            const scaleX = videoNativeWidth / coords.drawWidth;
+            const scaleY = videoNativeHeight / coords.drawHeight;
+            debugScaleFactor.textContent = `${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`;
+          }
+
+          debugLastUpdate.textContent = new Date().toLocaleTimeString();
+        }
+      }
+
+      // === PHASE 1: FIXED COORDINATE MAPPING with object-fit: contain support ===
+      function mapPointerToRemote(clientX, clientY) {
+        // Check if video native dimensions are available
+        if (!videoNativeWidth || !videoNativeHeight) {
+          console.warn("[COORDS] Video native dimensions not available");
+          return null;
+        }
+
+        const rect = video.getBoundingClientRect();
+
+        // Get coordinates relative to video element
+        const mouseX = clientX - rect.left;
+        const mouseY = clientY - rect.top;
+
+        // Check element boundaries
+        if (
+          mouseX < 0 ||
+          mouseX > rect.width ||
+          mouseY < 0 ||
+          mouseY > rect.height
+        ) {
+          return null;
+        }
+
+        // FIXED: Calculate object-fit: contain dimensions and offsets
+        const videoNativeRatio = videoNativeWidth / videoNativeHeight;
+        const elementRatio = rect.width / rect.height;
+
+        let drawWidth,
+          drawHeight,
+          offsetX = 0,
+          offsetY = 0;
+
+        if (elementRatio > videoNativeRatio) {
+          // Element is wider than video - letterboxing with vertical bars
+          drawHeight = rect.height;
+          drawWidth = drawHeight * videoNativeRatio;
+          offsetX = (rect.width - drawWidth) / 2;
+          offsetY = 0;
+        } else {
+          // Element is taller than video - letterboxing with horizontal bars
+          drawWidth = rect.width;
+          drawHeight = drawWidth / videoNativeRatio;
+          offsetX = 0;
+          offsetY = (rect.height - drawHeight) / 2;
+        }
+
+        // Calculate mouse position within the actual video draw area
+        const xInVideo = mouseX - offsetX;
+        const yInVideo = mouseY - offsetY;
+
+        // Check if mouse is within the video draw area
+        if (
+          xInVideo < 0 ||
+          xInVideo > drawWidth ||
+          yInVideo < 0 ||
+          yInVideo > drawHeight
+        ) {
+          console.log(
+            `[COORDS] Mouse outside video draw area: ${Math.round(xInVideo)},${Math.round(yInVideo)} vs ${Math.round(drawWidth)}x${Math.round(drawHeight)}`,
+          );
+          return null;
+        }
+
+        // PHASE 1: Map to remote coordinates
+        const remoteX = Math.round((xInVideo / drawWidth) * videoNativeWidth);
+        const remoteY = Math.round((yInVideo / drawHeight) * videoNativeHeight);
+
+        // Clamp coordinates to valid range
+        const clampedX = Math.max(0, Math.min(videoNativeWidth - 1, remoteX));
+        const clampedY = Math.max(0, Math.min(videoNativeHeight - 1, remoteY));
+
+        // Update debug info with all calculated values
+        updateDebugInfo({
+          drawWidth,
+          drawHeight,
+          offsetX,
+          offsetY,
+          mouseX,
+          mouseY,
+          xInVideo,
+          yInVideo,
+          remoteX: clampedX,
+          remoteY: clampedY,
+        });
+
+        console.log(
+          `[COORDS] Element: ${Math.round(mouseX)},${Math.round(mouseY)} → Draw: ${Math.round(xInVideo)},${Math.round(yInVideo)} → Remote: ${clampedX},${clampedY}`,
+        );
+
+        return { x: clampedX, y: clampedY };
+      }
+
+      // === COMMUNICATION FUNCTIONS ===
       function sendControl(type, payload = {}) {
         if (controlChannel && controlChannel.readyState === "open") {
           try {
             const message = { type, ...payload };
-            // JSON сообщение отправляется как ТЕКСТ через control DataChannel
             controlChannel.send(JSON.stringify(message));
+            console.log(`[CONTROL] Sent: ${type}`, payload);
           } catch (e) {
-            console.error("Failed to send control message:", e);
+            console.error("[CONTROL] Failed to send message:", e);
           }
+        } else {
+          console.warn(`[CONTROL] Channel not ready for ${type}`);
         }
       }
 
-      // ОТПРАВКА BLOB ДАННЫХ через binaryChannel (DataChannel внутри WebRTC)
-      // Используется для: запросов скриншотов, передачи файлов
       function sendBinary(messageType, payload = new Uint8Array()) {
         if (binaryChannel && binaryChannel.readyState === "open") {
           try {
-            // Формируем бинарный пакет: 4 байта тип + данные
             const typeBytes = new TextEncoder().encode(
               messageType.padEnd(4).slice(0, 4),
             );
             const message = new Uint8Array(typeBytes.length + payload.length);
             message.set(typeBytes, 0);
             message.set(payload, typeBytes.length);
-            // Бинарное сообщение отправляется как ArrayBuffer через binary DataChannel
             binaryChannel.send(message);
+            console.log(
+              `[BINARY] Sent: ${messageType}, ${payload.length} bytes`,
+            );
           } catch (e) {
-            console.error("Failed to send binary message:", e);
+            console.error("[BINARY] Failed to send message:", e);
+          }
+        } else {
+          console.warn(`[BINARY] Channel not ready for ${messageType}`);
+        }
+      }
+
+      // === VIDEO DIMENSION SYNCHRONIZATION ===
+      function syncVideoDimensions() {
+        if (video.videoWidth && video.videoHeight) {
+          const newWidth = video.videoWidth;
+          const newHeight = video.videoHeight;
+
+          if (
+            videoNativeWidth !== newWidth ||
+            videoNativeHeight !== newHeight
+          ) {
+            const prevWidth = videoNativeWidth;
+            const prevHeight = videoNativeHeight;
+
+            videoNativeWidth = newWidth;
+            videoNativeHeight = newHeight;
+
+            console.log(
+              `[VIDEO] Native dimensions updated: ${prevWidth}x${prevHeight} → ${videoNativeWidth}x${videoNativeHeight}`,
+            );
+            updateDebugInfo();
+
+            // Send confirmation to Go agent
+            sendControl("video_dimensions_confirmed", {
+              width: videoNativeWidth,
+              height: videoNativeHeight,
+            });
           }
         }
       }
 
-      function clamp(v, min, max) {
-        return Math.max(min, Math.min(max, v));
-      }
+      // Video dimension monitoring
+      video.addEventListener("loadedmetadata", () => {
+        console.log("[VIDEO] Metadata loaded");
+        syncVideoDimensions();
+      });
 
+      video.addEventListener("resize", () => {
+        console.log("[VIDEO] Video resized");
+        syncVideoDimensions();
+      });
+
+      // Monitor video element size changes
+      new ResizeObserver(() => {
+        updateDebugInfo();
+      }).observe(video);
+
+      // === MOUSE EVENT HANDLERS ===
+      video.addEventListener("mousemove", (e) => {
+        const now = Date.now();
+        if (now - lastMouseMove < mouseMoveThrottle) return;
+        lastMouseMove = now;
+
+        const mapped = mapPointerToRemote(e.clientX, e.clientY);
+        if (mapped) {
+          sendControl("mouse_move", mapped);
+        }
+      });
+
+      // Mouse click events
+      ["mousedown", "mouseup"].forEach((evt) =>
+        video.addEventListener(evt, (e) => {
+          const mapped = mapPointerToRemote(e.clientX, e.clientY);
+          if (mapped) {
+            sendControl(evt === "mousedown" ? "mouse_down" : "mouse_up", {
+              button: e.button,
+              x: mapped.x,
+              y: mapped.y,
+            });
+          }
+          e.preventDefault();
+        }),
+      );
+
+      // === KEYBOARD EVENT HANDLERS ===
       function isPrintableKey(e) {
         return (
           e.key.length === 1 &&
           !e.ctrlKey &&
           !e.altKey &&
           !e.metaKey &&
-          e.key !== " " // Пробел — специальная клавиша
+          e.key !== " "
         );
       }
 
@@ -296,8 +556,6 @@
         ) {
           return null;
         }
-
-        const code = e.code || "";
 
         if (e.code === "Space") return "space";
 
@@ -322,11 +580,6 @@
           ShiftRight: "shift",
           AltLeft: "alt",
           AltRight: "alt",
-          MetaLeft: navigator.platform.startsWith("Mac") ? "command" : "win",
-          MetaRight: navigator.platform.startsWith("Mac") ? "command" : "win",
-          CapsLock: "capslock",
-          NumLock: "numlock",
-          ScrollLock: "scrolllock",
           F1: "f1",
           F2: "f2",
           F3: "f3",
@@ -339,22 +592,6 @@
           F10: "f10",
           F11: "f11",
           F12: "f12",
-          Numpad0: "0",
-          Numpad1: "1",
-          Numpad2: "2",
-          Numpad3: "3",
-          Numpad4: "4",
-          Numpad5: "5",
-          Numpad6: "6",
-          Numpad7: "7",
-          Numpad8: "8",
-          Numpad9: "9",
-          NumpadDecimal: "period",
-          NumpadAdd: "add",
-          NumpadSubtract: "minus",
-          NumpadMultiply: "multiply",
-          NumpadDivide: "divide",
-          NumpadEnter: "enter",
           BracketLeft: "[",
           BracketRight: "]",
           Semicolon: ";",
@@ -368,414 +605,9 @@
           Backquote: "`",
         };
 
-        return keyMap[code] || null;
+        return keyMap[e.code] || null;
       }
 
-      // --- WebSocket and WebRTC Connection ---
-      async function connect() {
-        // Создаем WebSocket соединение для сигнализации WebRTC (НЕ для передачи данных!)
-        const addr =
-          "ws://" + window.location.hostname + ":8000/ws/viewer/agent1";
-        ws = new WebSocket(addr);
-
-        ws.onopen = async () => {
-          console.log("WebSocket connected to", addr);
-          setStatus("Connected");
-
-          if (pc) pc.close();
-
-          // Создаем WebRTC соединение
-          pc = new RTCPeerConnection({
-            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-          });
-
-          // СОЗДАНИЕ ДВУХ DataChannel внутри WebRTC соединения:
-          // 1. "control" - для JSON сообщений (ordered=true для надежности)
-          controlChannel = pc.createDataChannel("control", { ordered: true });
-          // 2. "binary" - для BLOB данных (ordered=true для корректной передачи файлов)
-          binaryChannel = pc.createDataChannel("binary", { ordered: true });
-
-          // Настраиваем обработчики для каждого канала
-          setupControlChannel(controlChannel);
-          setupBinaryChannel(binaryChannel);
-          setupPeerConnection(pc);
-
-          try {
-            // Создаем SDP offer и отправляем через WebSocket для сигнализации
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            ws.send(JSON.stringify(offer));
-          } catch (err) {
-            console.error("Error creating or sending offer:", err);
-            setStatus("WebRTC Error", "#f00");
-            pc.close();
-            ws.close();
-          }
-        };
-
-        ws.onmessage = async (e) => {
-          try {
-            // Получаем сигнальные сообщения (SDP answer, ICE candidates)
-            const data = JSON.parse(e.data);
-            if (data.type === "answer") {
-              await pc.setRemoteDescription(data);
-            } else if (data.candidate) {
-              await pc.addIceCandidate(data);
-            }
-          } catch (err) {
-            console.error("Error parsing or handling WebSocket message:", err);
-          }
-        };
-
-        ws.onclose = () => {
-          console.warn("WebSocket disconnected. Retrying in 2 seconds...");
-          setStatus("Reconnecting...", "#f90");
-          setChannelStatus("control", "Disconnected", "#f90");
-          setChannelStatus("binary", "Disconnected", "#f90");
-          setChannelStatus("video", "Disconnected", "#f90");
-          if (pc) pc.close();
-          setTimeout(connect, 2000);
-        };
-
-        ws.onerror = (err) => {
-          console.error("WebSocket error:", err);
-          setStatus("WS Error", "#f00");
-          ws.close();
-        };
-      }
-
-      // НАСТРОЙКА controlChannel - для передачи JSON команд и получения ответов
-      function setupControlChannel(channel) {
-        channel.onopen = () => {
-          setStatus("Control Ready");
-          setChannelStatus("control", "Connected", "#0f0");
-          screenshotBtn.disabled = false;
-          console.log("Control DataChannel opened");
-          // Сразу запрашиваем информацию об экране через JSON сообщение
-          sendControl("request_screen_info");
-        };
-
-        // ПОЛУЧЕНИЕ JSON СООБЩЕНИЙ от Go-агента через controlChannel
-        channel.onmessage = (e) => {
-          try {
-            const data = JSON.parse(e.data);
-            handleControlMessage(data);
-          } catch (err) {
-            console.warn("Failed to parse control message:", err, e.data);
-          }
-        };
-
-        channel.onclose = () => {
-          setChannelStatus("control", "Disconnected", "#f66");
-          screenshotBtn.disabled = true;
-          console.log("Control DataChannel closed");
-        };
-
-        channel.onerror = (e) => {
-          console.error("Control DataChannel error:", e);
-          setChannelStatus("control", "Error", "#f00");
-        };
-      }
-
-      // НАСТРОЙКА binaryChannel - для передачи BLOB данных (скриншоты, файлы)
-      function setupBinaryChannel(channel) {
-        // Устанавливаем тип данных как ArrayBuffer для бинарных данных
-        channel.binaryType = "arraybuffer";
-
-        channel.onopen = () => {
-          setChannelStatus("binary", "Connected", "#0f0");
-          console.log("Binary DataChannel opened");
-        };
-
-        // ПОЛУЧЕНИЕ BLOB ДАННЫХ от Go-агента через binaryChannel
-        channel.onmessage = (e) => {
-          handleBinaryMessage(e.data);
-        };
-
-        channel.onclose = () => {
-          setChannelStatus("binary", "Disconnected", "#f66");
-          console.log("Binary DataChannel closed");
-        };
-
-        channel.onerror = (e) => {
-          console.error("Binary DataChannel error:", e);
-          setChannelStatus("binary", "Error", "#f00");
-        };
-      }
-
-      function setupPeerConnection(pcInstance) {
-        // Получение видеопотока через WebRTC (отдельно от DataChannels)
-        pcInstance.ontrack = (e) => {
-          if (video.srcObject !== e.streams[0]) {
-            video.srcObject = e.streams[0];
-            setChannelStatus("video", "Streaming", "#0f0");
-            console.log("Received remote video stream");
-          }
-        };
-
-        pcInstance.onicecandidate = (e) => {
-          if (e.candidate) {
-            // Отправляем ICE candidates через WebSocket для сигнализации
-            ws.send(JSON.stringify(e.candidate));
-          }
-        };
-
-        pcInstance.onconnectionstatechange = () => {
-          console.log("Peer Connection State:", pcInstance.connectionState);
-          const state = pcInstance.connectionState;
-
-          if (state === "connected") {
-            setStatus("Full Connected", "#0f0");
-          } else if (state === "failed" || state === "closed") {
-            setStatus("Connection Lost", "#f00");
-            setChannelStatus("video", "Disconnected", "#f00");
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.close();
-            }
-          } else if (state === "connecting") {
-            setStatus("Connecting...", "#ff0");
-          }
-        };
-
-        // Настраиваем прием только видео (без аудио)
-        pcInstance.addTransceiver("video", { direction: "recvonly" });
-      }
-
-      // ОБРАБОТКА JSON СООБЩЕНИЙ полученных через controlChannel
-      function handleControlMessage(data) {
-        switch (data.type) {
-          case "screen_info":
-            // Получили информацию о размерах экрана от Go-агента
-            remoteScreenWidth = data.width;
-            remoteScreenHeight = data.height;
-            console.log(
-              "Received Screen Info:",
-              remoteScreenWidth,
-              "x",
-              remoteScreenHeight,
-            );
-            syncVideoDimensions();
-            break;
-
-          case "window_info":
-            // Получили информацию о текущем окне от Go-агента
-            windowInfoRequestPending = false;
-            currentWindow = {
-              x: data.x,
-              y: data.y,
-              width: data.width,
-              height: data.height,
-              title: data.title,
-            };
-            console.log(
-              "Received Window Info:",
-              currentWindow.title,
-              currentWindow.width + "x" + currentWindow.height,
-            );
-            break;
-
-          default:
-            console.log("Unknown control message type:", data.type);
-        }
-      }
-
-      // ОБРАБОТКА BLOB ДАННЫХ полученных через binaryChannel
-      function handleBinaryMessage(arrayBuffer) {
-        const data = new Uint8Array(arrayBuffer);
-        if (data.length < 4) {
-          console.warn("Binary message too short");
-          return;
-        }
-
-        // Извлекаем тип сообщения из первых 4 байт
-        const msgType = String.fromCharCode(...data.slice(0, 4));
-        const payload = data.slice(4);
-
-        switch (msgType) {
-          case "SCRN":
-            // Получили данные скриншота в виде PNG
-            handleScreenshotData(payload);
-            break;
-          case "FILE":
-            // Получили данные файла
-            handleFileData(payload);
-            break;
-          default:
-            console.log("Unknown binary message type:", msgType);
-        }
-      }
-
-      // ОБРАБОТКА BLOB ДАННЫХ СКРИНШОТА
-      function handleScreenshotData(data) {
-        screenshotCounter++;
-        console.log(
-          `Received screenshot #${screenshotCounter}, size: ${data.length} bytes`,
-        );
-
-        // Создаем Blob из полученных PNG данных
-        const blob = new Blob([data], { type: "image/png" });
-        const url = URL.createObjectURL(blob);
-
-        // Отображаем скриншот в модальном окне
-        screenshotImg.src = url;
-        screenshotModal.style.display = "flex";
-
-        // Auto cleanup URL after some time
-        setTimeout(() => URL.revokeObjectURL(url), 30000);
-      }
-
-      function handleFileData(data) {
-        console.log("Received file data:", data.length, "bytes");
-        // Handle file transfers here
-      }
-
-      // --- Mouse and Video Handling ---
-      function syncVideoDimensions() {
-        if (video.videoWidth && video.videoHeight) {
-          if (
-            !remoteScreenWidth ||
-            !remoteScreenHeight ||
-            Math.abs(remoteScreenWidth - video.videoWidth) > 10 ||
-            Math.abs(remoteScreenHeight - video.videoHeight) > 10
-          ) {
-            remoteScreenWidth = video.videoWidth;
-            remoteScreenHeight = video.videoHeight;
-            console.log(
-              "Auto-synced remote dimensions:",
-              remoteScreenWidth,
-              "x",
-              remoteScreenHeight,
-            );
-            sendControl("request_screen_info");
-          }
-        }
-      }
-
-      video.addEventListener("loadedmetadata", syncVideoDimensions);
-      new ResizeObserver(syncVideoDimensions).observe(video);
-
-      function mapPointerToRemote(clientX, clientY) {
-        if (remoteScreenWidth <= 0 || remoteScreenHeight <= 0) {
-          console.warn(
-            "Remote screen dimensions not available for mouse mapping",
-          );
-          return null;
-        }
-
-        const rect = video.getBoundingClientRect();
-        const videoNativeRatio = remoteScreenWidth / remoteScreenHeight;
-        const videoElementRatio = rect.width / rect.height;
-
-        let drawWidth,
-          drawHeight,
-          offsetX = 0,
-          offsetY = 0;
-
-        if (videoElementRatio > videoNativeRatio) {
-          drawHeight = rect.height;
-          drawWidth = drawHeight * videoNativeRatio;
-          offsetX = (rect.width - drawWidth) / 2;
-        } else {
-          drawWidth = rect.width;
-          drawHeight = drawWidth / videoNativeRatio;
-          offsetY = (rect.height - drawHeight) / 2;
-        }
-
-        const xInVideo = clientX - rect.left - offsetX;
-        const yInVideo = clientY - rect.top - offsetY;
-
-        if (
-          xInVideo < 0 ||
-          xInVideo > drawWidth ||
-          yInVideo < 0 ||
-          yInVideo > drawHeight
-        ) {
-          return null;
-        }
-
-        const remoteX = Math.round(
-          clamp(xInVideo / drawWidth, 0, 1) * remoteScreenWidth,
-        );
-        const remoteY = Math.round(
-          clamp(yInVideo / drawHeight, 0, 1) * remoteScreenHeight,
-        );
-
-        return { x: remoteX, y: remoteY };
-      }
-
-      const EDGE_THRESHOLD = 10;
-
-      function getWindowEdgeCursor(clientX, clientY) {
-        if (
-          currentWindow.width <= 0 ||
-          currentWindow.height <= 0 ||
-          remoteScreenWidth <= 0 ||
-          remoteScreenHeight <= 0
-        ) {
-          return null;
-        }
-
-        const mapped = mapPointerToRemote(clientX, clientY);
-        if (!mapped) return null;
-
-        const winX = mapped.x - currentWindow.x;
-        const winY = mapped.y - currentWindow.y;
-
-        if (
-          winX < 0 ||
-          winY < 0 ||
-          winX > currentWindow.width ||
-          winY > currentWindow.height
-        ) {
-          return null;
-        }
-
-        const onTop = winY < EDGE_THRESHOLD;
-        const onBottom = winY > currentWindow.height - EDGE_THRESHOLD;
-        const onLeft = winX < EDGE_THRESHOLD;
-        const onRight = winX > currentWindow.width - EDGE_THRESHOLD;
-
-        if (onTop && onLeft) return "nw-resize";
-        if (onTop && onRight) return "ne-resize";
-        if (onBottom && onLeft) return "sw-resize";
-        if (onBottom && onRight) return "se-resize";
-        if (onTop || onBottom) return "ns-resize";
-        if (onLeft || onRight) return "ew-resize";
-
-        return null;
-      }
-
-      // Mouse Event Handlers
-      video.addEventListener("mouseleave", () => {
-        video.style.cursor = "default";
-      });
-
-      video.addEventListener("mousemove", (e) => {
-        const cursor = getWindowEdgeCursor(e.clientX, e.clientY);
-        video.style.cursor = cursor || "default";
-
-        const now = Date.now();
-        if (now - lastMouseMove < mouseMoveThrottle) return;
-        lastMouseMove = now;
-
-        const mapped = mapPointerToRemote(e.clientX, e.clientY);
-        if (mapped) {
-          // Отправляем команду перемещения мыши через controlChannel (JSON)
-          sendControl("mouse_move", mapped);
-        }
-      });
-
-      ["mousedown", "mouseup"].forEach((evt) =>
-        video.addEventListener(evt, (e) => {
-          // Отправляем команды кликов мыши через controlChannel (JSON)
-          sendControl(evt === "mousedown" ? "mouse_down" : "mouse_up", {
-            button: e.button,
-          });
-          e.preventDefault();
-        }),
-      );
-
-      // Keyboard Event Handlers
       window.addEventListener("keydown", (e) => {
         if (!controlChannel || controlChannel.readyState !== "open") return;
 
@@ -786,28 +618,28 @@
           return;
         }
 
-        // Escape to close screenshot
+        // ESC to close screenshot
         if (e.key === "Escape" && screenshotModal.style.display === "flex") {
           closeScreenshot();
           e.preventDefault();
           return;
         }
 
+        // Handle printable keys
         if (isPrintableKey(e) && e.key.length === 1) {
           let latKey = e.key;
           if (/[а-яёА-ЯЁ]/.test(latKey)) {
             latKey = cyrillicToLatinMap[latKey.toLowerCase()] || latKey;
           }
-          // Отправляем команду нажатия клавиши через controlChannel (JSON)
           sendControl("key_down", { key: latKey });
           e.preventDefault();
           return;
         }
 
+        // Handle special keys
         const robotKey = mapKeyEventToRobotKey(e);
         if (robotKey) {
           e.preventDefault();
-          // Отправляем команду нажатия клавиши через controlChannel (JSON)
           sendControl("key_down", { key: robotKey });
         } else {
           e.preventDefault();
@@ -823,7 +655,6 @@
           /[а-яёА-ЯЁ]/.test(e.key)
         ) {
           const latKey = cyrillicToLatinMap[e.key.toLowerCase()] || e.key;
-          // Отправляем команду отпускания клавиши через controlChannel (JSON)
           sendControl("key_up", { key: latKey });
           e.preventDefault();
           return;
@@ -832,7 +663,6 @@
         const robotKey = mapKeyEventToRobotKey(e);
         if (robotKey) {
           e.preventDefault();
-          // Отправляем команду отпускания клавиши через controlChannel (JSON)
           sendControl("key_up", { key: robotKey });
         } else {
           e.preventDefault();
@@ -844,71 +674,316 @@
         if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
           currentLayout = currentLayout === "ru" ? "en" : "ru";
           updateLayoutIndicator();
+          console.log(`[KEYBOARD] Layout switched to: ${currentLayout}`);
           e.preventDefault();
         }
       });
 
-      // --- UI Functions ---
-      function requestScreenshot() {
-        if (!binaryChannel || binaryChannel.readyState !== "open") {
-          console.warn("Binary channel not available for screenshot");
+      // === WebRTC CONNECTION SETUP ===
+      async function connect() {
+        const addr =
+          "ws://" + window.location.hostname + ":8000/ws/viewer/agent1";
+        console.log(`[WS] Connecting to: ${addr}`);
+
+        ws = new WebSocket(addr);
+
+        ws.onopen = async () => {
+          console.log("[WS] Connected successfully");
+          setStatus("Connected");
+
+          // Clean up old peer connection
+          if (pc) {
+            pc.close();
+          }
+
+          // Create new WebRTC peer connection
+          pc = new RTCPeerConnection({
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+          });
+
+          // Create data channels
+          controlChannel = pc.createDataChannel("control", { ordered: true });
+          binaryChannel = pc.createDataChannel("binary", { ordered: true });
+
+          setupControlChannel(controlChannel);
+          setupBinaryChannel(binaryChannel);
+          setupPeerConnection(pc);
+
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify(offer));
+            console.log("[WebRTC] SDP offer sent");
+          } catch (err) {
+            console.error("[WebRTC] Error creating offer:", err);
+            setStatus("WebRTC Error", "#f00");
+            pc.close();
+            ws.close();
+          }
+        };
+
+        // FIXED: Handle both text and binary messages properly
+        ws.onmessage = async (e) => {
+          try {
+            // Check if it's a text message (should be JSON for WebRTC signaling)
+            if (typeof e.data === "string") {
+              const data = JSON.parse(e.data);
+              if (data.type === "answer") {
+                await pc.setRemoteDescription(data);
+                console.log("[WebRTC] SDP answer received");
+              } else if (data.candidate) {
+                await pc.addIceCandidate(data);
+                console.log("[WebRTC] ICE candidate received");
+              } else {
+                console.log("[WS] Unknown message type:", data.type);
+              }
+            } else {
+              // Binary message (should not happen in signaling, but handle gracefully)
+              console.log(
+                "[WS] Received binary message, ignoring for signaling",
+              );
+            }
+          } catch (err) {
+            console.error("[WS] Error handling message:", err);
+          }
+        };
+
+        ws.onclose = () => {
+          console.warn("[WS] Disconnected, retrying in 2 seconds...");
+          setStatus("Reconnecting...", "#f90");
+          setChannelStatus("control", "Disconnected", "#f90");
+          setChannelStatus("binary", "Disconnected", "#f90");
+          setChannelStatus("video", "Disconnected", "#f90");
+          if (pc) pc.close();
+          setTimeout(connect, 2000);
+        };
+
+        ws.onerror = (err) => {
+          console.error("[WS] Error:", err);
+          setStatus("WS Error", "#f00");
+        };
+      }
+
+      // === DATA CHANNEL SETUP ===
+      function setupControlChannel(channel) {
+        channel.onopen = () => {
+          console.log("[CONTROL] DataChannel opened");
+          setStatus("Control Ready");
+          setChannelStatus("control", "Connected", "#0f0");
+          screenshotBtn.disabled = false;
+
+          // Request initial video info
+          sendControl("request_video_info");
+        };
+
+        channel.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            handleControlMessage(data);
+          } catch (err) {
+            console.warn("[CONTROL] Failed to parse message:", err, e.data);
+          }
+        };
+
+        channel.onclose = () => {
+          console.log("[CONTROL] DataChannel closed");
+          setChannelStatus("control", "Disconnected", "#f66");
+          screenshotBtn.disabled = true;
+        };
+
+        channel.onerror = (err) => {
+          console.error("[CONTROL] DataChannel error:", err);
+        };
+      }
+
+      function setupBinaryChannel(channel) {
+        channel.binaryType = "arraybuffer";
+
+        channel.onopen = () => {
+          console.log("[BINARY] DataChannel opened");
+          setChannelStatus("binary", "Connected", "#0f0");
+        };
+
+        channel.onmessage = (e) => {
+          handleBinaryMessage(e.data);
+        };
+
+        channel.onclose = () => {
+          console.log("[BINARY] DataChannel closed");
+          setChannelStatus("binary", "Disconnected", "#f66");
+        };
+
+        channel.onerror = (err) => {
+          console.error("[BINARY] DataChannel error:", err);
+        };
+      }
+
+      function setupPeerConnection(pcInstance) {
+        pcInstance.ontrack = (e) => {
+          if (video.srcObject !== e.streams[0]) {
+            video.srcObject = e.streams[0];
+            setChannelStatus("video", "Streaming", "#0f0");
+            console.log("[WebRTC] Video stream received");
+
+            // Trigger video dimension sync when stream starts
+            setTimeout(syncVideoDimensions, 1000);
+          }
+        };
+
+        pcInstance.onicecandidate = (e) => {
+          if (e.candidate) {
+            ws.send(JSON.stringify(e.candidate));
+          }
+        };
+
+        pcInstance.onconnectionstatechange = () => {
+          const state = pcInstance.connectionState;
+          console.log(`[WebRTC] Connection state: ${state}`);
+
+          if (state === "connected") {
+            setStatus("Full Connected", "#0f0");
+          } else if (state === "failed" || state === "closed") {
+            setStatus("Connection Lost", "#f00");
+            setChannelStatus("video", "Disconnected", "#f00");
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.close();
+            }
+          } else if (state === "connecting") {
+            setStatus("Connecting...", "#ff0");
+          }
+        };
+
+        // Only receive video, no audio
+        pcInstance.addTransceiver("video", { direction: "recvonly" });
+      }
+
+      // === MESSAGE HANDLING ===
+      function handleControlMessage(data) {
+        console.log("[CONTROL] Received:", data);
+
+        switch (data.type) {
+          case "video_info":
+            if (data.width && data.height) {
+              console.log(
+                `[CONTROL] Server video info: ${data.width}x${data.height}`,
+              );
+
+              // Compare with local video dimensions
+              if (videoNativeWidth && videoNativeHeight) {
+                if (
+                  videoNativeWidth !== data.width ||
+                  videoNativeHeight !== data.height
+                ) {
+                  console.warn(
+                    `[CONTROL] Video size mismatch! Local: ${videoNativeWidth}x${videoNativeHeight}, Server: ${data.width}x${data.height}`,
+                  );
+                } else {
+                  console.log("[CONTROL] Video dimensions confirmed matching");
+                }
+              }
+            }
+            break;
+
+          case "pong":
+            console.log("[CONTROL] Pong received");
+            break;
+
+          default:
+            console.log("[CONTROL] Unknown message type:", data.type);
+        }
+      }
+
+      function handleBinaryMessage(arrayBuffer) {
+        const data = new Uint8Array(arrayBuffer);
+        if (data.length < 4) {
+          console.warn("[BINARY] Message too short:", data.length);
           return;
         }
 
-        console.log("Requesting screenshot...");
-        // Отправляем запрос на скриншот через binaryChannel (BLOB данные)
+        const msgType = String.fromCharCode(...data.slice(0, 4));
+        const payload = data.slice(4);
+
+        console.log(
+          `[BINARY] Received: ${msgType.trim()}, ${payload.length} bytes`,
+        );
+
+        switch (msgType.trim()) {
+          case "SCRN":
+            handleScreenshotData(payload);
+            break;
+          default:
+            console.log("[BINARY] Unknown message type:", msgType);
+        }
+      }
+
+      function handleScreenshotData(data) {
+        screenshotCounter++;
+        console.log(
+          `[SCREENSHOT] #${screenshotCounter} received: ${data.length} bytes`,
+        );
+
+        const blob = new Blob([data], { type: "image/png" });
+        const url = URL.createObjectURL(blob);
+
+        screenshotImg.src = url;
+        screenshotModal.style.display = "flex";
+
+        // Cleanup URL after 30 seconds
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+      }
+
+      // === UI FUNCTIONS ===
+      function requestScreenshot() {
+        if (!binaryChannel || binaryChannel.readyState !== "open") {
+          console.warn("[SCREENSHOT] Binary channel not available");
+          return;
+        }
+
+        console.log("[SCREENSHOT] Requesting...");
         sendBinary("SCRN", new TextEncoder().encode("REQUEST"));
       }
 
       function closeScreenshot() {
         screenshotModal.style.display = "none";
-        if (screenshotImg.src) {
+        if (screenshotImg.src && screenshotImg.src.startsWith("blob:")) {
           URL.revokeObjectURL(screenshotImg.src);
           screenshotImg.src = "";
         }
       }
 
-      function showStats() {
-        const stats = {
-          remoteScreenWidth,
-          remoteScreenHeight,
-          currentWindow,
-          screenshotCounter,
-          controlChannelState: controlChannel?.readyState || "null",
-          binaryChannelState: binaryChannel?.readyState || "null",
-          videoState: video.srcObject ? "active" : "none",
-        };
+      function toggleDebug() {
+        const isVisible = debugInfo.style.display !== "none";
+        debugInfo.style.display = isVisible ? "none" : "block";
+        console.log(`[DEBUG] Panel ${isVisible ? "hidden" : "shown"}`);
 
-        alert("RMM Stats:\n" + JSON.stringify(stats, null, 2));
+        if (!isVisible) {
+          updateDebugInfo();
+        }
       }
 
-      // Event Listeners
+      // === EVENT LISTENERS ===
       screenshotBtn.addEventListener("click", requestScreenshot);
-      document.getElementById("statsBtn").addEventListener("click", showStats);
+      document
+        .getElementById("debugBtn")
+        .addEventListener("click", toggleDebug);
 
-      // Close screenshot on click outside
       screenshotModal.addEventListener("click", (e) => {
         if (e.target === screenshotModal) {
           closeScreenshot();
         }
       });
 
-      // Initialize
+      // === INITIALIZATION ===
+      console.log("[INIT] Starting RMM Viewer v2.0 - Phase 1 Fixed");
       updateLayoutIndicator();
       connect();
 
-      // Window info polling
+      // Periodic ping to keep connection alive
       setInterval(() => {
-        if (
-          controlChannel &&
-          controlChannel.readyState === "open" &&
-          !windowInfoRequestPending
-        ) {
-          windowInfoRequestPending = true;
-          // Запрашиваем информацию об активном окне через controlChannel (JSON)
-          sendControl("request_window_info");
+        if (controlChannel && controlChannel.readyState === "open") {
+          sendControl("ping");
         }
-      }, WINDOW_INFO_INTERVAL);
+      }, 30000);
     </script>
   </body>
 </html>
