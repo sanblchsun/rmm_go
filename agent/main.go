@@ -1,3 +1,4 @@
+// agent/main.go
 package main
 
 import (
@@ -25,7 +26,7 @@ import (
 )
 
 const (
-	serverURL           = "ws://192.168.2.222:8000/ws/agent/agent1"
+	serverURL           = "ws://192.168.88.127:8000/ws/agent/agent1"
 	websocketMaxRetries = 5
 	websocketRetryDelay = 5 * time.Second
 )
@@ -84,6 +85,10 @@ var (
 	currentQuality = "medium"
 	qualityMutex   sync.RWMutex
 	screenDetected bool
+
+	// Resolution change monitoring
+	resolutionChangeTimer *time.Timer
+	resolutionCheckMutex  sync.Mutex
 )
 
 // === CHANNEL MANAGER ===
@@ -125,7 +130,96 @@ func initializeNativeScreen() error {
 	screenDetected = true
 
 	log.Printf("[PHASE3] Native screen initialized: %dx%d", nativeScreen.Width, nativeScreen.Height)
+
+	// Start resolution monitoring
+	go monitorResolutionChanges()
+
 	return nil
+}
+
+// === RESOLUTION CHANGE MONITORING ===
+func monitorResolutionChanges() {
+	ticker := time.NewTicker(2 * time.Second) // Check every 2 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			checkForResolutionChange()
+		}
+	}
+}
+
+func checkForResolutionChange() {
+	newScreen, err := detectNativeResolution()
+	if err != nil {
+		log.Printf("[RESOLUTION] Failed to detect resolution: %v", err)
+		return
+	}
+
+	resolutionCheckMutex.Lock()
+	defer resolutionCheckMutex.Unlock()
+
+	// Check if resolution changed
+	if newScreen.Width != nativeScreen.Width || newScreen.Height != nativeScreen.Height {
+		oldScreen := nativeScreen
+		nativeScreen = newScreen
+
+		log.Printf("[RESOLUTION] Screen resolution changed: %dx%d -> %dx%d",
+			oldScreen.Width, oldScreen.Height,
+			nativeScreen.Width, nativeScreen.Height)
+
+		// Cancel existing timer if any
+		if resolutionChangeTimer != nil {
+			resolutionChangeTimer.Stop()
+		}
+
+		// Set a timer to restart FFmpeg after a short delay (to avoid rapid restarts)
+		resolutionChangeTimer = time.AfterFunc(1*time.Second, func() {
+			log.Printf("[RESOLUTION] Triggering FFmpeg restart for resolution change")
+
+			// Restart FFmpeg
+			select {
+			case ffmpegRestartSignal <- struct{}{}:
+				log.Printf("[RESOLUTION] FFmpeg restart signal sent")
+			default:
+				log.Printf("[RESOLUTION] FFmpeg restart signal already pending")
+			}
+
+			// Send updated resolution info to browser after a delay
+			go func() {
+				time.Sleep(3 * time.Second) // Wait for FFmpeg to restart
+				sendResolutionChangeNotification()
+			}()
+		})
+	}
+}
+
+func sendResolutionChangeNotification() {
+	if !screenDetected {
+		return
+	}
+
+	quality := getCurrentQuality()
+
+	// Send resolution change notification
+	notification := map[string]interface{}{
+		"type":              "resolution_changed",
+		"width":             nativeScreen.Width,
+		"height":            nativeScreen.Height,
+		"quality_level":     currentQuality,
+		"bitrate":           quality.Bitrate,
+		"fps":               quality.FPS,
+		"coordinate_mode":   "native_1_to_1",
+		"phase":             "3_adaptive",
+		"force_video_reset": true, // Force browser to reset video element
+	}
+
+	if err := sendControlMessage(notification); err != nil {
+		log.Printf("[ERROR] Failed to send resolution_changed: %v", err)
+	} else {
+		log.Printf("[RESOLUTION] Sent resolution change notification: %dx%d", nativeScreen.Width, nativeScreen.Height)
+	}
 }
 
 // === QUALITY MANAGEMENT ===
@@ -266,14 +360,13 @@ func handleScreenshotRequest(payload []byte) {
 // === MAIN FUNCTION ===
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("🚀 RMM Agent v3.0 - Phase 3: Adaptive Native Resolution")
+	log.Printf("🚀 RMM Agent v3.1 - Phase 3: Adaptive Native Resolution with Auto-Restart")
 
 	// PHASE 3: Initialize native screen detection
 	if err := initializeNativeScreen(); err != nil {
 		log.Fatalf("Failed to initialize screen: %v", err)
 	}
 
-	// ИСПРАВЛЕНО: Удалена неиспользуемая переменная quality
 	log.Printf("Native resolution: %dx%d, Quality: %s",
 		nativeScreen.Width, nativeScreen.Height, currentQuality)
 	log.Printf("Connecting to: %s", serverURL)
@@ -374,6 +467,13 @@ func handleControlMessage(data []byte) {
 			log.Printf("[SUCCESS] Browser-Agent resolution synchronized: %dx%d", nativeScreen.Width, nativeScreen.Height)
 		}
 
+	// === MANUAL RESOLUTION CHECK REQUEST ===
+	case "check_resolution":
+		log.Printf("[CONTROL] Manual resolution check requested")
+		go func() {
+			checkForResolutionChange()
+		}()
+
 	// === PHASE 3: QUALITY CHANGE (BITRATE ONLY) ===
 	case "change_quality":
 		quality, ok := ctl["quality_level"].(string)
@@ -437,7 +537,6 @@ func handleControlMessage(data []byte) {
 
 	// === PHASE 3: NATIVE 1:1 COORDINATE MAPPING ===
 	case "mouse_move":
-		// ИСПРАВЛЕНО: Проверка screenDetected перед использованием nativeScreen
 		if !screenDetected {
 			log.Printf("[CONTROL] Screen not detected, ignoring mouse_move")
 			return
@@ -613,7 +712,7 @@ func manageFFmpegProcess(videoTrack *webrtc.TrackLocalStaticSample) {
 
 		select {
 		case <-ffmpegRestartSignal:
-			log.Println("[FFMPEG] Restart signal received for bitrate change")
+			log.Println("[FFMPEG] Restart signal received")
 			ffmpegMutex.Lock()
 			if cmd != nil && cmd.Process != nil {
 				if runtime.GOOS == "windows" {
@@ -645,7 +744,6 @@ func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-
 	buf := make([]byte, 0, maxNALUBufferSize)
 	tmp := make([]byte, 4096)
 
-	// ИСПРАВЛЕНО: Используем качество напрямую в коде, где это необходимо
 	for {
 		select {
 		case <-quit:
@@ -689,7 +787,6 @@ func streamVideo(r io.Reader, videoTrack *webrtc.TrackLocalStaticSample, quit <-
 				case <-quit:
 					return
 				default:
-					// ИСПРАВЛЕНО: Получаем качество только когда используем
 					quality := getCurrentQuality()
 					_ = videoTrack.WriteSample(media.Sample{
 						Data:     nalu,
@@ -838,7 +935,6 @@ func handleSDP(msg []byte, out chan []byte, pcs map[string]*webrtc.PeerConnectio
 	pcs["viewer"] = pc
 	lock.Unlock()
 
-	// ИСПРАВЛЕНО: Проверяем ошибки SetRemoteDescription и SetLocalDescription
 	if err := pc.SetRemoteDescription(sdp); err != nil {
 		log.Printf("[WebRTC] SetRemoteDescription error: %v", err)
 		return true

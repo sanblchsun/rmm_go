@@ -1,8 +1,9 @@
+<!-- templates/index.html -->
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>RMM Viewer v2.0 - Phase 2 Optimized</title>
+    <title>RMM Viewer v3.1 - Phase 3 Native Adaptive</title>
     <style>
       html,
       body {
@@ -176,7 +177,7 @@
         z-index: 1000;
       }
 
-      .quality-indicator {
+      .resolution-info {
         position: fixed;
         right: 10px;
         bottom: 40px;
@@ -190,19 +191,21 @@
         border: 1px solid #333;
       }
 
-      .performance-stats {
+      .notification {
         position: fixed;
-        left: 10px;
-        top: 160px;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: rgba(0, 0, 0, 0.9);
         color: #0f0;
+        border: 2px solid #0f0;
+        padding: 20px;
+        border-radius: 5px;
         font-family: monospace;
-        font-size: 8px;
-        background: rgba(0, 0, 0, 0.7);
-        padding: 5px;
-        border-radius: 3px;
-        z-index: 1000;
-        border: 1px solid #333;
+        font-size: 14px;
+        z-index: 3000;
         display: none;
+        text-align: center;
       }
     </style>
   </head>
@@ -221,33 +224,25 @@
     </div>
 
     <div class="version-info">
-      RMM v2.0 - Phase 2 Optimized<br />
-      Adaptive Quality + Performance
+      RMM v3.1 - Phase 3<br />
+      Native Adaptive Resolution<br />
+      Auto Resolution Detection
     </div>
 
-    <div class="quality-indicator">
-      <div>Res: <span id="qualityRes">-</span></div>
-      <div>FPS: <span id="qualityFps">-</span></div>
-      <div>Ping: <span id="qualityPing">-</span>ms</div>
-    </div>
-
-    <div class="performance-stats" id="performanceStats">
-      <div><strong>PERFORMANCE</strong></div>
-      <hr style="margin: 2px 0; border-color: #333" />
-      <div>Coord Cache: <span id="perfCoordCache">0</span> hits</div>
-      <div>Mouse Events: <span id="perfMouseEvents">0</span>/s</div>
-      <div>Frame Rate: <span id="perfFrameRate">0</span> fps</div>
-      <div>Bandwidth: <span id="perfBandwidth">0</span> Mbps</div>
-      <div>Latency: <span id="perfLatency">0</span>ms</div>
+    <div class="resolution-info">
+      <div>Native: <span id="nativeRes">-</span></div>
+      <div>Video: <span id="videoRes">-</span></div>
+      <div>Quality: <span id="qualityLevel">-</span></div>
+      <div>Ping: <span id="pingTime">-</span>ms</div>
     </div>
 
     <div class="controls">
       <div class="control-row">
         <select id="qualitySelector" class="quality-selector">
-          <option value="720p">720p (Fast)</option>
-          <option value="1080p" selected>1080p (Balanced)</option>
-          <option value="1440p">1440p (Quality)</option>
-          <option value="auto">Auto Adapt</option>
+          <option value="low">Low (1M)</option>
+          <option value="medium" selected>Medium (3M)</option>
+          <option value="high">High (6M)</option>
+          <option value="ultra">Ultra (12M)</option>
         </select>
         <button id="applyQuality" class="btn">Apply</button>
       </div>
@@ -255,23 +250,30 @@
       <div class="control-row">
         <button id="screenshotBtn" class="btn" disabled>Screenshot (F9)</button>
         <button id="debugBtn" class="btn">Debug</button>
-        <button id="perfBtn" class="btn">Perf</button>
+        <button id="checkResBtn" class="btn">Check Resolution</button>
       </div>
     </div>
 
     <!-- Debug Info -->
     <div id="debugInfo" class="debug-info" style="display: none">
-      <div><strong>PHASE 2 DEBUG - OPTIMIZED</strong></div>
+      <div><strong>PHASE 3 DEBUG - NATIVE ADAPTIVE</strong></div>
       <hr style="margin: 3px 0; border-color: #333" />
       <div>Video Native: <span id="debugVideoSize">-</span></div>
       <div>Element Size: <span id="debugElementSize">-</span></div>
       <div>Draw Area: <span id="debugDrawArea">-</span></div>
-      <div>Cached Mapping: <span id="debugCachedMapping">-</span></div>
+      <div>Scale: <span id="debugScaleFactor">-</span></div>
       <div>Mouse Local: <span id="debugMouseCoords">-</span></div>
       <div>Mouse Remote: <span id="debugRemoteCoords">-</span></div>
-      <div>Scale Factor: <span id="debugScaleFactor">-</span></div>
-      <div>Cache Hits: <span id="debugCacheHits">0</span></div>
       <div>Last Update: <span id="debugLastUpdate">-</span></div>
+      <div>Mode: <span id="debugMode">Native 1:1</span></div>
+    </div>
+
+    <!-- Notification -->
+    <div id="notification" class="notification">
+      <div id="notificationText">Resolution Change Detected</div>
+      <div style="margin-top: 10px; font-size: 12px">
+        Video will reset automatically...
+      </div>
     </div>
 
     <!-- Screenshot Modal -->
@@ -281,68 +283,31 @@
     </div>
 
     <script>
-      // === RMM VIEWER v2.0 - PHASE 2: OPTIMIZED WITH ADAPTIVE QUALITY ===
-      console.log(
-        "🚀 RMM Viewer v2.0 - Phase 2: Optimized with Adaptive Quality",
-      );
+      // === RMM VIEWER v3.1 - PHASE 3: NATIVE ADAPTIVE RESOLUTION ===
+      console.log("🚀 RMM Viewer v3.1 - Phase 3: Native Adaptive Resolution");
 
       // WebRTC и WebSocket variables
       let pc, ws;
       let controlChannel, binaryChannel;
 
-      // PHASE 2: Quality Management
-      const QUALITY_PRESETS = {
-        "720p": {
-          width: 1280,
-          height: 720,
-          bitrate: "2M",
-          maxrate: "3M",
-          bufsize: "4M",
-        },
-        "1080p": {
-          width: 1920,
-          height: 1080,
-          bitrate: "4M",
-          maxrate: "6M",
-          bufsize: "8M",
-        },
-        "1440p": {
-          width: 2560,
-          height: 1440,
-          bitrate: "8M",
-          maxrate: "12M",
-          bufsize: "16M",
-        },
-      };
+      // PHASE 3: Native resolution tracking
+      let nativeResolution = { width: 0, height: 0 };
+      let currentQualityLevel = "medium";
 
-      let currentQuality = "1080p";
-      let autoQualityEnabled = false;
-
-      // PHASE 2: Coordinate mapping cache
+      // Coordinate mapping cache
       let coordinateCache = {
         videoNativeWidth: 0,
         videoNativeHeight: 0,
         elementRect: null,
         drawArea: null,
         lastCacheUpdate: 0,
-        cacheHits: 0,
         cacheDuration: 100, // ms
       };
 
       let lastMouseMove = 0;
-      const mouseMoveThrottle = 8; // OPTIMIZED: Higher frequency for better responsiveness
+      const mouseMoveThrottle = 8; // 125fps
       let currentLayout = "en";
       let screenshotCounter = 0;
-
-      // PHASE 2: Performance monitoring
-      let performanceStats = {
-        mouseEventsPerSecond: 0,
-        mouseEventCount: 0,
-        frameRate: 0,
-        bandwidth: 0,
-        latency: 0,
-        lastStatsUpdate: 0,
-      };
 
       // DOM elements
       const statusEl = document.getElementById("status");
@@ -357,31 +322,26 @@
       const screenshotImg = document.getElementById("screenshotImg");
       const qualitySelector = document.getElementById("qualitySelector");
       const applyQualityBtn = document.getElementById("applyQuality");
+      const checkResBtn = document.getElementById("checkResBtn");
+      const notification = document.getElementById("notification");
+      const notificationText = document.getElementById("notificationText");
 
-      // Quality indicator elements
-      const qualityRes = document.getElementById("qualityRes");
-      const qualityFps = document.getElementById("qualityFps");
-      const qualityPing = document.getElementById("qualityPing");
+      // Resolution info elements
+      const nativeRes = document.getElementById("nativeRes");
+      const videoRes = document.getElementById("videoRes");
+      const qualityLevel = document.getElementById("qualityLevel");
+      const pingTime = document.getElementById("pingTime");
 
       // Debug elements
       const debugInfo = document.getElementById("debugInfo");
       const debugVideoSize = document.getElementById("debugVideoSize");
       const debugElementSize = document.getElementById("debugElementSize");
       const debugDrawArea = document.getElementById("debugDrawArea");
-      const debugCachedMapping = document.getElementById("debugCachedMapping");
+      const debugScaleFactor = document.getElementById("debugScaleFactor");
       const debugMouseCoords = document.getElementById("debugMouseCoords");
       const debugRemoteCoords = document.getElementById("debugRemoteCoords");
-      const debugScaleFactor = document.getElementById("debugScaleFactor");
-      const debugCacheHits = document.getElementById("debugCacheHits");
       const debugLastUpdate = document.getElementById("debugLastUpdate");
-
-      // Performance elements
-      const performanceStatsEl = document.getElementById("performanceStats");
-      const perfCoordCache = document.getElementById("perfCoordCache");
-      const perfMouseEvents = document.getElementById("perfMouseEvents");
-      const perfFrameRate = document.getElementById("perfFrameRate");
-      const perfBandwidth = document.getElementById("perfBandwidth");
-      const perfLatency = document.getElementById("perfLatency");
+      const debugMode = document.getElementById("debugMode");
 
       // Cyrillic to Latin mapping
       const cyrillicToLatinMap = {
@@ -447,21 +407,27 @@
         layoutIndicator.textContent = currentLayout === "ru" ? "RU" : "EN";
       }
 
-      function updateQualityIndicator(quality, fps = "-", ping = "-") {
-        currentQualityEl.textContent = quality;
-        qualityRes.textContent = quality;
-        qualityFps.textContent = fps;
-        qualityPing.textContent = ping;
+      function updateResolutionInfo() {
+        nativeRes.textContent = `${nativeResolution.width}x${nativeResolution.height}`;
+        videoRes.textContent = `${coordinateCache.videoNativeWidth}x${coordinateCache.videoNativeHeight}`;
+        qualityLevel.textContent = currentQualityLevel;
       }
 
-      // PHASE 2: Optimized coordinate cache
+      function showNotification(text, duration = 3000) {
+        notificationText.textContent = text;
+        notification.style.display = "block";
+        setTimeout(() => {
+          notification.style.display = "none";
+        }, duration);
+      }
+
+      // PHASE 3: Native 1:1 coordinate cache
       function updateCoordinateCache() {
         const now = Date.now();
         if (
           now - coordinateCache.lastCacheUpdate <
           coordinateCache.cacheDuration
         ) {
-          coordinateCache.cacheHits++;
           return false; // Cache is still valid
         }
 
@@ -519,7 +485,6 @@
 
           if (coordinateCache.drawArea) {
             debugDrawArea.textContent = `${Math.round(coordinateCache.drawArea.drawWidth)}x${Math.round(coordinateCache.drawArea.drawHeight)}`;
-            debugCachedMapping.textContent = `${Math.round(coordinateCache.drawArea.offsetX)},${Math.round(coordinateCache.drawArea.offsetY)}`;
           }
 
           if (coords.mouseX !== undefined && coords.mouseY !== undefined) {
@@ -540,12 +505,11 @@
             debugScaleFactor.textContent = `${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`;
           }
 
-          debugCacheHits.textContent = coordinateCache.cacheHits;
           debugLastUpdate.textContent = new Date().toLocaleTimeString();
         }
       }
 
-      // PHASE 2: Optimized coordinate mapping with caching
+      // PHASE 3: Native 1:1 coordinate mapping
       function mapPointerToRemote(clientX, clientY) {
         updateCoordinateCache();
 
@@ -582,6 +546,7 @@
           return null;
         }
 
+        // PHASE 3: Native 1:1 mapping
         const remoteX = Math.round(
           (xInVideo / coordinateCache.drawArea.drawWidth) *
             coordinateCache.videoNativeWidth,
@@ -646,36 +611,16 @@
         }
       }
 
-      // PHASE 2: Quality management
-      function changeQuality(quality) {
-        if (quality === "auto") {
-          autoQualityEnabled = true;
-          currentQuality = "1080p"; // Default for auto
-          console.log("[QUALITY] Auto-adapt mode enabled");
-        } else {
-          autoQualityEnabled = false;
-          currentQuality = quality;
-          console.log(`[QUALITY] Manual quality set to: ${quality}`);
-        }
+      // PHASE 3: Quality management
+      function changeQuality(qualityLevel) {
+        currentQualityLevel = qualityLevel;
 
-        const preset = QUALITY_PRESETS[currentQuality];
-        if (preset) {
-          sendControl("change_quality", {
-            quality: currentQuality,
-            width: preset.width,
-            height: preset.height,
-            bitrate: preset.bitrate,
-            maxrate: preset.maxrate,
-            bufsize: preset.bufsize,
-            autoAdapt: autoQualityEnabled,
-          });
+        sendControl("change_quality", {
+          quality_level: qualityLevel,
+        });
 
-          updateQualityIndicator(currentQuality);
-
-          // Reset coordinate cache when quality changes
-          coordinateCache.lastCacheUpdate = 0;
-          coordinateCache.cacheHits = 0;
-        }
+        updateResolutionInfo();
+        console.log(`[QUALITY] Changed to: ${qualityLevel}`);
       }
 
       // === VIDEO DIMENSION SYNCHRONIZATION ===
@@ -688,19 +633,17 @@
             coordinateCache.videoNativeWidth !== newWidth ||
             coordinateCache.videoNativeHeight !== newHeight
           ) {
-            const prevWidth = coordinateCache.videoNativeWidth;
-            const prevHeight = coordinateCache.videoNativeHeight;
+            console.log(
+              `[VIDEO] Native dimensions updated: ${coordinateCache.videoNativeWidth}x${coordinateCache.videoNativeHeight} → ${newWidth}x${newHeight}`,
+            );
 
             // Force cache update
             coordinateCache.lastCacheUpdate = 0;
             updateCoordinateCache();
-
-            console.log(
-              `[VIDEO] Native dimensions updated: ${prevWidth}x${prevHeight} → ${newWidth}x${newHeight}`,
-            );
             updateDebugInfo();
+            updateResolutionInfo();
 
-            sendControl("video_dimensions_confirmed", {
+            sendControl("browser_video_confirmed", {
               width: newWidth,
               height: newHeight,
             });
@@ -708,7 +651,7 @@
         }
       }
 
-      // Video dimension monitoring
+      // === VIDEO EVENT HANDLERS ===
       video.addEventListener("loadedmetadata", () => {
         console.log("[VIDEO] Metadata loaded");
         syncVideoDimensions();
@@ -730,9 +673,6 @@
         const now = Date.now();
         if (now - lastMouseMove < mouseMoveThrottle) return;
         lastMouseMove = now;
-
-        // Performance tracking
-        performanceStats.mouseEventCount++;
 
         const mapped = mapPointerToRemote(e.clientX, e.clientY);
         if (mapped) {
@@ -981,12 +921,8 @@
           setChannelStatus("control", "Connected", "#0f0");
           screenshotBtn.disabled = false;
 
-          // Send initial quality settings
-          sendControl("change_quality", {
-            quality: currentQuality,
-            ...QUALITY_PRESETS[currentQuality],
-            autoAdapt: autoQualityEnabled,
-          });
+          // Request native video info
+          sendControl("request_native_video_info");
         };
 
         channel.onmessage = (e) => {
@@ -1054,7 +990,6 @@
 
           if (state === "connected") {
             setStatus("Full Connected", "#0f0");
-            startPerformanceMonitoring();
           } else if (state === "failed" || state === "closed") {
             setStatus("Connection Lost", "#f00");
             setChannelStatus("video", "Disconnected", "#f00");
@@ -1075,49 +1010,54 @@
 
         // Calculate latency if timestamp provided
         if (data.timestamp) {
-          performanceStats.latency = Date.now() - data.timestamp;
-          qualityPing.textContent = performanceStats.latency;
+          const latency = Date.now() - data.timestamp;
+          pingTime.textContent = latency;
         }
 
         switch (data.type) {
-          case "video_info":
+          case "native_video_info":
             if (data.width && data.height) {
+              nativeResolution.width = data.width;
+              nativeResolution.height = data.height;
+              currentQualityLevel = data.quality_level || "medium";
+
               console.log(
-                `[CONTROL] Server video info: ${data.width}x${data.height}`,
+                `[CONTROL] Native video info: ${nativeResolution.width}x${nativeResolution.height} (${currentQualityLevel})`,
+              );
+              updateResolutionInfo();
+            }
+            break;
+
+          case "resolution_changed":
+            if (data.width && data.height) {
+              const oldRes = `${nativeResolution.width}x${nativeResolution.height}`;
+              nativeResolution.width = data.width;
+              nativeResolution.height = data.height;
+              const newRes = `${data.width}x${data.height}`;
+
+              console.log(`[RESOLUTION] Changed: ${oldRes} → ${newRes}`);
+              showNotification(
+                `Resolution Changed: ${oldRes} → ${newRes}`,
+                4000,
               );
 
-              if (
-                coordinateCache.videoNativeWidth &&
-                coordinateCache.videoNativeHeight
-              ) {
-                if (
-                  coordinateCache.videoNativeWidth !== data.width ||
-                  coordinateCache.videoNativeHeight !== data.height
-                ) {
-                  console.warn(
-                    `[CONTROL] Video size mismatch! Local: ${coordinateCache.videoNativeWidth}x${coordinateCache.videoNativeHeight}, Server: ${data.width}x${data.height}`,
-                  );
-                } else {
-                  console.log("[CONTROL] Video dimensions confirmed matching");
-                }
+              // Force video element reset if requested
+              if (data.force_video_reset) {
+                resetVideoElement();
               }
+
+              updateResolutionInfo();
             }
             break;
 
           case "quality_changed":
-            if (data.quality) {
-              currentQuality = data.quality;
-              updateQualityIndicator(data.quality, data.fps);
+            if (data.quality_level) {
+              currentQualityLevel = data.quality_level;
               console.log(
-                `[QUALITY] Server confirmed quality change: ${data.quality}`,
+                `[QUALITY] Server confirmed change: ${data.quality_level}`,
               );
+              updateResolutionInfo();
             }
-            break;
-
-          case "performance_stats":
-            if (data.fps) performanceStats.frameRate = data.fps;
-            if (data.bandwidth) performanceStats.bandwidth = data.bandwidth;
-            updatePerformanceDisplay();
             break;
 
           case "pong":
@@ -1167,34 +1107,21 @@
         setTimeout(() => URL.revokeObjectURL(url), 30000);
       }
 
-      // === PERFORMANCE MONITORING ===
-      function startPerformanceMonitoring() {
-        setInterval(() => {
-          const now = Date.now();
-          const timeDiff = (now - performanceStats.lastStatsUpdate) / 1000;
+      // === VIDEO ELEMENT RESET ===
+      function resetVideoElement() {
+        console.log(
+          "[VIDEO] Forcing video element reset for resolution change",
+        );
 
-          if (timeDiff >= 1) {
-            performanceStats.mouseEventsPerSecond = Math.round(
-              performanceStats.mouseEventCount / timeDiff,
-            );
-            performanceStats.mouseEventCount = 0;
-            performanceStats.lastStatsUpdate = now;
+        const currentSrc = video.srcObject;
+        video.srcObject = null;
 
-            updatePerformanceDisplay();
-          }
-        }, 1000);
-      }
+        setTimeout(() => {
+          video.srcObject = currentSrc;
+          coordinateCache.lastCacheUpdate = 0; // Force cache refresh
 
-      function updatePerformanceDisplay() {
-        if (performanceStatsEl.style.display !== "none") {
-          perfCoordCache.textContent = coordinateCache.cacheHits;
-          perfMouseEvents.textContent = performanceStats.mouseEventsPerSecond;
-          perfFrameRate.textContent = performanceStats.frameRate;
-          perfBandwidth.textContent = (
-            performanceStats.bandwidth / 1000000
-          ).toFixed(1); // Convert to Mbps
-          perfLatency.textContent = performanceStats.latency;
-        }
+          setTimeout(syncVideoDimensions, 1000);
+        }, 100);
       }
 
       // === UI FUNCTIONS ===
@@ -1226,14 +1153,10 @@
         }
       }
 
-      function togglePerformance() {
-        const isVisible = performanceStatsEl.style.display !== "none";
-        performanceStatsEl.style.display = isVisible ? "none" : "block";
-        console.log(`[PERFORMANCE] Panel ${isVisible ? "hidden" : "shown"}`);
-
-        if (!isVisible) {
-          updatePerformanceDisplay();
-        }
+      function checkResolution() {
+        console.log("[MANUAL] Requesting resolution check");
+        sendControl("check_resolution");
+        showNotification("Resolution check requested...", 2000);
       }
 
       // === EVENT LISTENERS ===
@@ -1241,9 +1164,7 @@
       document
         .getElementById("debugBtn")
         .addEventListener("click", toggleDebug);
-      document
-        .getElementById("perfBtn")
-        .addEventListener("click", togglePerformance);
+      checkResBtn.addEventListener("click", checkResolution);
 
       applyQualityBtn.addEventListener("click", () => {
         const selectedQuality = qualitySelector.value;
@@ -1259,9 +1180,9 @@
       });
 
       // === INITIALIZATION ===
-      console.log("[INIT] Starting RMM Viewer v2.0 - Phase 2 Optimized");
+      console.log("[INIT] Starting RMM Viewer v3.1 - Phase 3 Native Adaptive");
       updateLayoutIndicator();
-      updateQualityIndicator(currentQuality);
+      updateResolutionInfo();
       connect();
 
       // Periodic ping with latency measurement
@@ -1269,41 +1190,7 @@
         if (controlChannel && controlChannel.readyState === "open") {
           sendControl("ping");
         }
-      }, 10000); // Every 10 seconds
-
-      // Auto quality adaptation based on performance
-      setInterval(() => {
-        if (autoQualityEnabled && performanceStats.latency > 0) {
-          if (performanceStats.latency > 200 && currentQuality === "1440p") {
-            changeQuality("1080p");
-            console.log(
-              "[AUTO-QUALITY] Downgraded to 1080p due to high latency",
-            );
-          } else if (
-            performanceStats.latency > 500 &&
-            currentQuality === "1080p"
-          ) {
-            changeQuality("720p");
-            console.log(
-              "[AUTO-QUALITY] Downgraded to 720p due to high latency",
-            );
-          } else if (
-            performanceStats.latency < 100 &&
-            currentQuality === "720p"
-          ) {
-            changeQuality("1080p");
-            console.log("[AUTO-QUALITY] Upgraded to 1080p due to good latency");
-          } else if (
-            performanceStats.latency < 50 &&
-            currentQuality === "1080p"
-          ) {
-            changeQuality("1440p");
-            console.log(
-              "[AUTO-QUALITY] Upgraded to 1440p due to excellent latency",
-            );
-          }
-        }
-      }, 30000); // Check every 30 seconds
+      }, 5000); // Every 5 seconds
     </script>
   </body>
 </html>
